@@ -1,5 +1,7 @@
 import type { HttpClient } from '../http.js';
+import { Paginator } from '../paginator.js';
 import type {
+  Entity,
   SearchEntitiesParams,
   SearchEntitiesResponse,
   GetEntityParams,
@@ -16,6 +18,16 @@ export class EntitiesResource {
    */
   async search(params: SearchEntitiesParams): Promise<SearchEntitiesResponse> {
     return this.http.get<SearchEntitiesResponse>('/entities/search', params);
+  }
+
+  /**
+   * Auto-paginating search that yields every matching entity across all pages.
+   */
+  searchAll(params: Omit<SearchEntitiesParams, 'page'>): Paginator<Entity> {
+    return new Paginator(async (page) => {
+      const res = await this.search({ ...params, page });
+      return { items: res.entities, pagination: res.pagination };
+    });
   }
 
   /**

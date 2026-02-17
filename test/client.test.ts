@@ -8,7 +8,6 @@ import { AlertsResource } from '../src/resources/alerts.js';
 import { TopicsResource } from '../src/resources/topics.js';
 import { EntitiesResource } from '../src/resources/entities.js';
 import { ListsResource } from '../src/resources/lists.js';
-import { ChartsResource } from '../src/resources/charts.js';
 import { PublishersResource } from '../src/resources/publishers.js';
 import { mockFetch, mockFetchSequence } from './helpers.js';
 
@@ -20,7 +19,7 @@ describe('PodscanClient', () => {
   // Resource composition
   // -----------------------------------------------------------------------
 
-  it('exposes all 8 resource properties', () => {
+  it('exposes all 7 resource properties', () => {
     const mock = mockFetch();
     restore = mock.restore;
 
@@ -32,7 +31,6 @@ describe('PodscanClient', () => {
     assert.ok(client.topics instanceof TopicsResource);
     assert.ok(client.entities instanceof EntitiesResource);
     assert.ok(client.lists instanceof ListsResource);
-    assert.ok(client.charts instanceof ChartsResource);
     assert.ok(client.publishers instanceof PublishersResource);
   });
 
@@ -50,7 +48,7 @@ describe('PodscanClient', () => {
 
   it('rateLimit is populated after a request', async () => {
     const mock = mockFetch({
-      body: { episodes: [], pagination: {} },
+      body: { episodes: [], pagination: { total: 0 } },
       headers: {
         'x-ratelimit-limit': '2000',
         'x-ratelimit-remaining': '1999',
@@ -74,7 +72,7 @@ describe('PodscanClient', () => {
   it('rateLimit updates after each request', async () => {
     const mock = mockFetchSequence([
       {
-        body: { episodes: [], pagination: {} },
+        body: { episodes: [], pagination: { total: 0 } },
         headers: {
           'x-ratelimit-limit': '2000',
           'x-ratelimit-remaining': '1999',
@@ -82,7 +80,7 @@ describe('PodscanClient', () => {
         },
       },
       {
-        body: { podcasts: [], pagination: {} },
+        body: { podcasts: [], pagination: { total: 0 } },
         headers: {
           'x-ratelimit-limit': '2000',
           'x-ratelimit-remaining': '1998',
@@ -105,29 +103,31 @@ describe('PodscanClient', () => {
   // End-to-end flow
   // -----------------------------------------------------------------------
 
-  it('full workflow: search, get, transcript', async () => {
+  it('full workflow: search, get episode', async () => {
     const mock = mockFetchSequence([
       {
         body: {
-          episodes: [{ episode_id: 'ep_found', episode_title: 'AI Today' }],
-          pagination: { total: 1, page: 1, per_page: 25, has_more: false },
+          episodes: [
+            {
+              episode_id: 'ep_found',
+              episode_title: 'AI Today',
+              episode_duration: 3600,
+            },
+          ],
+          pagination: { total: 1, per_page: 25, current_page: 1, last_page: 1 },
         },
         headers: { 'x-ratelimit-remaining': '1997' },
       },
       {
         body: {
-          episode: { episode_id: 'ep_found', episode_title: 'AI Today', summary: 'About AI' },
+          episode: {
+            episode_id: 'ep_found',
+            episode_title: 'AI Today',
+            episode_duration: 3600,
+            episode_description: 'About AI',
+          },
         },
         headers: { 'x-ratelimit-remaining': '1996' },
-      },
-      {
-        body: {
-          episode_id: 'ep_found',
-          transcript: 'Welcome to the show...',
-          word_count: 5000,
-          duration: 3600,
-        },
-        headers: { 'x-ratelimit-remaining': '1995' },
       },
     ]);
     restore = mock.restore;
@@ -137,19 +137,13 @@ describe('PodscanClient', () => {
     const searchResults = await client.episodes.search({ query: 'artificial intelligence' });
     assert.equal(searchResults.episodes.length, 1);
     assert.equal(searchResults.episodes[0].episode_id, 'ep_found');
+    assert.equal(searchResults.pagination.total, 1);
 
-    const episode = await client.episodes.get({
-      episode_id: 'ep_found',
-      include_transcript: false,
-    });
-    assert.equal(episode.episode.summary, 'About AI');
+    const episode = await client.episodes.get({ episode_id: 'ep_found' });
+    assert.equal(episode.episode.episode_description, 'About AI');
 
-    const transcript = await client.episodes.getTranscript({ episode_id: 'ep_found' });
-    assert.equal(transcript.transcript, 'Welcome to the show...');
-    assert.equal(transcript.word_count, 5000);
-
-    assert.equal(mock.captured.length, 3);
-    assert.equal(client.rateLimit?.remaining, 1995);
+    assert.equal(mock.captured.length, 2);
+    assert.equal(client.rateLimit?.remaining, 1996);
   });
 
   // -----------------------------------------------------------------------
@@ -159,7 +153,7 @@ describe('PodscanClient', () => {
   it('API errors propagate through resources', async () => {
     const mock = mockFetch({
       status: 404,
-      body: { code: 'not_found', message: 'Episode not found' },
+      body: { error: 'Not found. Check your request and try again.' },
     });
     restore = mock.restore;
 
@@ -169,7 +163,6 @@ describe('PodscanClient', () => {
       () => client.episodes.get({ episode_id: 'ep_nonexistent' }),
       (err: unknown) => {
         assert.ok(err instanceof PodscanError);
-        assert.equal(err.code, 'not_found');
         assert.equal(err.status, 404);
         return true;
       },
@@ -222,14 +215,14 @@ describe('Package exports', () => {
 
     assert.ok(exports.PodscanClient);
     assert.ok(exports.PodscanError);
-
+    assert.ok(exports.periods);
+    assert.ok(exports.Paginator);
     assert.ok(exports.EpisodesResource);
     assert.ok(exports.PodcastsResource);
     assert.ok(exports.AlertsResource);
     assert.ok(exports.TopicsResource);
     assert.ok(exports.EntitiesResource);
     assert.ok(exports.ListsResource);
-    assert.ok(exports.ChartsResource);
     assert.ok(exports.PublishersResource);
   });
 

@@ -4,13 +4,13 @@
   "description": "Lightweight, zero-dependency TypeScript SDK for the Podscan REST API",
   "author": "Podscan <support@podscan.fm> (https://podscan.fm)",
   "license": "MIT",
-  "homepage": "https://github.com/podscan/podscan-node#readme",
+  "homepage": "https://github.com/wilsr7000/podscan-node#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/podscan/podscan-node.git"
+    "url": "git+https://github.com/wilsr7000/podscan-node.git"
   },
   "bugs": {
-    "url": "https://github.com/podscan/podscan-node/issues"
+    "url": "https://github.com/wilsr7000/podscan-node/issues"
   },
   "type": "module",
   "main": "./dist/index.cjs",
@@ -41,6 +41,7 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:integration": "node --env-file=.env --import tsx --test test/integration.test.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",

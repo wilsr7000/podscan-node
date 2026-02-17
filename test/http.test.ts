@@ -110,7 +110,10 @@ describe('HttpClient', () => {
     restore = mock.restore;
 
     const client = new HttpClient({ apiKey: 'key' });
-    const result = await client.post<{ id: string }>('/alerts', { name: 'Test', filters: '"brand"' });
+    const result = await client.post<{ id: string }>('/alerts', {
+      name: 'Test',
+      filters: '"brand"',
+    });
 
     assert.equal(result.id, 'al_123');
     assert.equal(mock.captured[0].method, 'POST');
@@ -187,14 +190,17 @@ describe('HttpClient', () => {
 
     const client = new HttpClient({ apiKey: 'key' });
 
-    await assert.rejects(() => client.get('/test'), (err: unknown) => {
-      assert.ok(err instanceof PodscanError);
-      assert.equal(err.code, 'quota_exceeded');
-      assert.equal(err.message, 'Daily API quota exceeded (2000/2000)');
-      assert.equal(err.status, 429);
-      assert.deepEqual(err.details, { daily_used: 2000, daily_limit: 2000 });
-      return true;
-    });
+    await assert.rejects(
+      () => client.get('/test'),
+      (err: unknown) => {
+        assert.ok(err instanceof PodscanError);
+        assert.equal(err.code, 'quota_exceeded');
+        assert.equal(err.message, 'Daily API quota exceeded (2000/2000)');
+        assert.equal(err.status, 429);
+        assert.deepEqual(err.details, { daily_used: 2000, daily_limit: 2000 });
+        return true;
+      },
+    );
   });
 
   it('throws PodscanError on 5xx without body', async () => {
@@ -203,12 +209,15 @@ describe('HttpClient', () => {
 
     const client = new HttpClient({ apiKey: 'key' });
 
-    await assert.rejects(() => client.get('/test'), (err: unknown) => {
-      assert.ok(err instanceof PodscanError);
-      assert.equal(err.code, 'api_error');
-      assert.equal(err.status, 500);
-      return true;
-    });
+    await assert.rejects(
+      () => client.get('/test'),
+      (err: unknown) => {
+        assert.ok(err instanceof PodscanError);
+        assert.equal(err.code, 'api_error');
+        assert.equal(err.status, 500);
+        return true;
+      },
+    );
   });
 
   it('throws PodscanError on network failure', async () => {
@@ -217,13 +226,16 @@ describe('HttpClient', () => {
 
     const client = new HttpClient({ apiKey: 'key' });
 
-    await assert.rejects(() => client.get('/test'), (err: unknown) => {
-      assert.ok(err instanceof PodscanError);
-      assert.equal(err.code, 'network_error');
-      assert.equal(err.message, 'Failed to fetch');
-      assert.equal(err.status, 0);
-      return true;
-    });
+    await assert.rejects(
+      () => client.get('/test'),
+      (err: unknown) => {
+        assert.ok(err instanceof PodscanError);
+        assert.equal(err.code, 'network_error');
+        assert.equal(err.message, 'Failed to fetch');
+        assert.equal(err.status, 0);
+        return true;
+      },
+    );
   });
 
   it('throws PodscanError on timeout (AbortError)', async () => {
@@ -233,13 +245,16 @@ describe('HttpClient', () => {
 
     const client = new HttpClient({ apiKey: 'key', timeout: 5000 });
 
-    await assert.rejects(() => client.get('/test'), (err: unknown) => {
-      assert.ok(err instanceof PodscanError);
-      assert.equal(err.code, 'timeout');
-      assert.ok(err.message.includes('5000'));
-      assert.equal(err.status, 0);
-      return true;
-    });
+    await assert.rejects(
+      () => client.get('/test'),
+      (err: unknown) => {
+        assert.ok(err instanceof PodscanError);
+        assert.equal(err.code, 'timeout');
+        assert.ok(err.message.includes('5000'));
+        assert.equal(err.status, 0);
+        return true;
+      },
+    );
   });
 
   // -----------------------------------------------------------------------

@@ -7,16 +7,15 @@ import { AlertsResource } from '../src/resources/alerts.js';
 import { TopicsResource } from '../src/resources/topics.js';
 import { EntitiesResource } from '../src/resources/entities.js';
 import { ListsResource } from '../src/resources/lists.js';
-import { ChartsResource } from '../src/resources/charts.js';
 import { PublishersResource } from '../src/resources/publishers.js';
-import { mockFetch } from './helpers.js';
+import { mockFetch, mockFetchSequence } from './helpers.js';
 
 function makeHttp(): HttpClient {
   return new HttpClient({ apiKey: 'test-key' });
 }
 
 // ==========================================================================
-// Episodes Resource (5 endpoints)
+// Episodes Resource (4 endpoints)
 // ==========================================================================
 
 describe('EpisodesResource', () => {
@@ -25,7 +24,10 @@ describe('EpisodesResource', () => {
 
   it('search() calls GET /episodes/search with params', async () => {
     const mock = mockFetch({
-      body: { episodes: [{ episode_id: 'ep_1' }], pagination: { total: 1 } },
+      body: {
+        episodes: [{ episode_id: 'ep_1', episode_title: 'Test' }],
+        pagination: { total: 1, per_page: 1, current_page: 1, last_page: 1 },
+      },
     });
     restore = mock.restore;
 
@@ -39,46 +41,36 @@ describe('EpisodesResource', () => {
     assert.equal(url.searchParams.get('language'), 'en');
     assert.equal(url.searchParams.get('per_page'), '10');
     assert.equal(result.episodes.length, 1);
+    assert.equal(result.pagination.total, 1);
   });
 
   it('get() calls GET /episodes/:id with query options', async () => {
     const mock = mockFetch({
-      body: { episode: { episode_id: 'ep_abc', episode_title: 'Test' } },
+      body: {
+        episode: {
+          episode_id: 'ep_abc',
+          episode_title: 'Test',
+          episode_duration: 1800,
+          posted_at: '2026-01-01',
+        },
+      },
     });
     restore = mock.restore;
 
     const resource = new EpisodesResource(makeHttp());
-    await resource.get({ episode_id: 'ep_abc', include_transcript: true });
+    const result = await resource.get({ episode_id: 'ep_abc', include_transcript: true });
 
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/episodes/ep_abc');
     assert.equal(url.searchParams.get('include_transcript'), 'true');
     assert.equal(url.searchParams.has('episode_id'), false);
-  });
-
-  it('getTranscript() calls GET /episodes/:id/transcript', async () => {
-    const mock = mockFetch({
-      body: { transcript: 'Hello world', word_count: 2 },
-    });
-    restore = mock.restore;
-
-    const resource = new EpisodesResource(makeHttp());
-    const result = await resource.getTranscript({
-      episode_id: 'ep_xyz',
-      format: 'timestamped',
-      search: 'hello',
-    });
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/episodes/ep_xyz/transcript');
-    assert.equal(url.searchParams.get('format'), 'timestamped');
-    assert.equal(url.searchParams.get('search'), 'hello');
-    assert.equal(result.transcript, 'Hello world');
+    assert.equal(result.episode.episode_title, 'Test');
+    assert.equal(result.episode.episode_duration, 1800);
   });
 
   it('getRecent() calls GET /episodes/recent with optional params', async () => {
     const mock = mockFetch({
-      body: { episodes: [], count: 0 },
+      body: { episodes: [{ episode_id: 'ep_r1' }] },
     });
     restore = mock.restore;
 
@@ -91,19 +83,21 @@ describe('EpisodesResource', () => {
   });
 
   it('getRecent() works without params', async () => {
-    const mock = mockFetch({ body: { episodes: [], count: 0 } });
+    const mock = mockFetch({ body: { episodes: [] } });
     restore = mock.restore;
 
     const resource = new EpisodesResource(makeHttp());
     await resource.getRecent();
 
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/episodes/recent');
+    assert.equal(new URL(mock.captured[0].url).pathname, '/api/v1/episodes/recent');
   });
 
   it('getByPodcast() calls GET /podcasts/:id/episodes', async () => {
     const mock = mockFetch({
-      body: { episodes: [], pagination: { total: 0 } },
+      body: {
+        episodes: [],
+        pagination: { total: 0, per_page: 50, current_page: 1, last_page: 1 },
+      },
     });
     restore = mock.restore;
 
@@ -116,10 +110,64 @@ describe('EpisodesResource', () => {
     assert.equal(url.searchParams.get('per_page'), '50');
     assert.equal(url.searchParams.has('podcast_id'), false);
   });
+
+  it('searchAll() auto-paginates across pages', async () => {
+    const mock = mockFetchSequence([
+      {
+        body: {
+          episodes: [{ episode_id: 'ep_1', posted_at: '2026-02-15T10:00:00Z' }],
+          pagination: { total: 2, per_page: 1, current_page: 1, last_page: 2, from: 1, to: 1 },
+        },
+      },
+      {
+        body: {
+          episodes: [{ episode_id: 'ep_2', posted_at: '2026-02-16T10:00:00Z' }],
+          pagination: { total: 2, per_page: 1, current_page: 2, last_page: 2, from: 2, to: 2 },
+        },
+      },
+    ]);
+    restore = mock.restore;
+
+    const resource = new EpisodesResource(makeHttp());
+    const collected: string[] = [];
+    const paginator = resource.searchAll({ query: 'AI', per_page: 1 });
+
+    for await (const ep of paginator) {
+      collected.push(ep.episode_id);
+    }
+
+    assert.deepEqual(collected, ['ep_1', 'ep_2']);
+    assert.equal(mock.captured.length, 2);
+    assert.equal(paginator.totalSeen, 2);
+    assert.equal(paginator.checkpoint().lastSeenId, 'ep_2');
+  });
+
+  it('getByPodcastAll() auto-paginates podcast episodes', async () => {
+    const mock = mockFetchSequence([
+      {
+        body: {
+          episodes: [{ episode_id: 'ep_a', posted_at: '2026-02-15T10:00:00Z' }],
+          pagination: { total: 1, per_page: 1, current_page: 1, last_page: 1, from: 1, to: 1 },
+        },
+      },
+    ]);
+    restore = mock.restore;
+
+    const resource = new EpisodesResource(makeHttp());
+    const collected: string[] = [];
+
+    for await (const ep of resource.getByPodcastAll({ podcast_id: 'pd_abc', per_page: 1 })) {
+      collected.push(ep.episode_id);
+    }
+
+    assert.deepEqual(collected, ['ep_a']);
+    const url = new URL(mock.captured[0].url);
+    assert.equal(url.pathname, '/api/v1/podcasts/pd_abc/episodes');
+  });
 });
 
 // ==========================================================================
-// Podcasts Resource (5 endpoints)
+// Podcasts Resource (2 endpoints)
 // ==========================================================================
 
 describe('PodcastsResource', () => {
@@ -128,7 +176,10 @@ describe('PodcastsResource', () => {
 
   it('search() calls GET /podcasts/search', async () => {
     const mock = mockFetch({
-      body: { podcasts: [{ podcast_id: 'pd_1' }], pagination: { total: 1 } },
+      body: {
+        podcasts: [{ podcast_id: 'pd_1', podcast_name: 'Biz Show' }],
+        pagination: { total: 1, per_page: 1, current_page: 1, last_page: 1 },
+      },
     });
     restore = mock.restore;
 
@@ -145,78 +196,30 @@ describe('PodcastsResource', () => {
     assert.equal(url.searchParams.get('has_guests'), 'true');
     assert.equal(url.searchParams.get('min_episode_count'), '50');
     assert.equal(result.podcasts.length, 1);
+    assert.equal(result.podcasts[0].podcast_name, 'Biz Show');
   });
 
   it('get() calls GET /podcasts/:id', async () => {
     const mock = mockFetch({
-      body: { podcast: { podcast_id: 'pd_abc', podcast_name: 'My Show' } },
+      body: {
+        podcast: {
+          podcast_id: 'pd_abc',
+          podcast_name: 'My Show',
+          episode_count: 100,
+          language: 'en',
+        },
+      },
     });
     restore = mock.restore;
 
     const resource = new PodcastsResource(makeHttp());
-    const result = await resource.get({
-      podcast_id: 'pd_abc',
-      include_episodes: true,
-      episode_limit: 5,
-    });
+    const result = await resource.get({ podcast_id: 'pd_abc', include_episodes: true });
 
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/podcasts/pd_abc');
     assert.equal(url.searchParams.get('include_episodes'), 'true');
-    assert.equal(url.searchParams.get('episode_limit'), '5');
     assert.equal(result.podcast.podcast_name, 'My Show');
-  });
-
-  it('getSimilar() calls GET /podcasts/:id/similar', async () => {
-    const mock = mockFetch({ body: { podcasts: [] } });
-    restore = mock.restore;
-
-    const resource = new PodcastsResource(makeHttp());
-    await resource.getSimilar({ podcast_id: 'pd_xyz', limit: 10 });
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/podcasts/pd_xyz/similar');
-    assert.equal(url.searchParams.get('limit'), '10');
-  });
-
-  it('getReviews() calls GET /podcasts/:id/reviews', async () => {
-    const mock = mockFetch({
-      body: { reviews: { combined_rating: 4.5, itunes_rating_average: 4.6 } },
-    });
-    restore = mock.restore;
-
-    const resource = new PodcastsResource(makeHttp());
-    const result = await resource.getReviews({ podcast_id: 'pd_abc' });
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/podcasts/pd_abc/reviews');
-    assert.equal(result.reviews.combined_rating, 4.5);
-  });
-
-  it('getDemographics() calls GET /podcasts/demographics', async () => {
-    const mock = mockFetch({
-      body: { podcasts: [], pagination: { total: 0 } },
-    });
-    restore = mock.restore;
-
-    const resource = new PodcastsResource(makeHttp());
-    await resource.getDemographics({ language: 'en', min_audience_size: 1000 });
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/podcasts/demographics');
-    assert.equal(url.searchParams.get('language'), 'en');
-    assert.equal(url.searchParams.get('min_audience_size'), '1000');
-  });
-
-  it('getDemographics() works without params', async () => {
-    const mock = mockFetch({ body: { podcasts: [], pagination: {} } });
-    restore = mock.restore;
-
-    const resource = new PodcastsResource(makeHttp());
-    await resource.getDemographics();
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/podcasts/demographics');
+    assert.equal(result.podcast.episode_count, 100);
   });
 });
 
@@ -230,7 +233,10 @@ describe('AlertsResource', () => {
 
   it('list() calls GET /alerts', async () => {
     const mock = mockFetch({
-      body: { alerts: [{ alert_id: 'al_1' }], pagination: { total: 1 } },
+      body: {
+        alerts: [{ alert_id: 'al_1', alert_name: 'Brand' }],
+        pagination: { total: 1, per_page: 25, current_page: 1, last_page: 1 },
+      },
     });
     restore = mock.restore;
 
@@ -244,7 +250,9 @@ describe('AlertsResource', () => {
   });
 
   it('list() works without params', async () => {
-    const mock = mockFetch({ body: { alerts: [], pagination: {} } });
+    const mock = mockFetch({
+      body: { alerts: [], pagination: { total: 0 } },
+    });
     restore = mock.restore;
 
     const resource = new AlertsResource(makeHttp());
@@ -255,7 +263,10 @@ describe('AlertsResource', () => {
 
   it('getMentions() calls GET /alerts/:id/mentions', async () => {
     const mock = mockFetch({
-      body: { mentions: [{ mention_id: 'mn_1' }], pagination: { total: 1 } },
+      body: {
+        mentions: [{ mention_id: 'mn_1' }],
+        pagination: { total: 1 },
+      },
     });
     restore = mock.restore;
 
@@ -293,8 +304,6 @@ describe('AlertsResource', () => {
     const body = JSON.parse(mock.captured[0].body!);
     assert.equal(body.name, 'Brand Monitor');
     assert.equal(body.filters, '"Acme Corp"');
-    assert.equal(body.webhook_url, 'https://example.com/hook');
-    assert.equal(body.webhook_active, true);
     assert.equal(result.alert.alert_name, 'Brand Monitor');
   });
 });
@@ -309,22 +318,27 @@ describe('TopicsResource', () => {
 
   it('search() calls GET /topics/search', async () => {
     const mock = mockFetch({
-      body: { topics: [{ topic_id: 'tp_1' }], pagination: { total: 1 } },
+      body: {
+        topics: [{ topic_id: 'tp_1', name: 'AI', occurrences_count: 500 }],
+        pagination: { total: 1 },
+      },
     });
     restore = mock.restore;
 
     const resource = new TopicsResource(makeHttp());
-    await resource.search({ query: 'cryptocurrency', min_episodes: 100 });
+    const result = await resource.search({ query: 'AI', per_page: 1 });
 
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/topics/search');
-    assert.equal(url.searchParams.get('query'), 'cryptocurrency');
-    assert.equal(url.searchParams.get('min_episodes'), '100');
+    assert.equal(url.searchParams.get('query'), 'AI');
+    assert.equal(result.topics[0].name, 'AI');
   });
 
   it('get() calls GET /topics/:id', async () => {
     const mock = mockFetch({
-      body: { topic: { topic_id: 'tp_abc', topic_name: 'AI' } },
+      body: {
+        topic: { topic_id: 'tp_abc', name: 'AI', occurrences_count: 7000 },
+      },
     });
     restore = mock.restore;
 
@@ -334,7 +348,7 @@ describe('TopicsResource', () => {
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/topics/tp_abc');
     assert.equal(url.searchParams.get('with_history'), 'true');
-    assert.equal(result.topic.topic_name, 'AI');
+    assert.equal(result.topic.name, 'AI');
   });
 
   it('getEpisodes() calls GET /topics/:id/episodes', async () => {
@@ -358,7 +372,10 @@ describe('TopicsResource', () => {
 
   it('getTrending() calls GET /topics/trending', async () => {
     const mock = mockFetch({
-      body: { topics: [{ topic_id: 'tp_1', mention_count: 500 }] },
+      body: {
+        topics: [{ topic_id: 'tp_1', name: 'AI', occurrences: 500 }],
+        timeframe: '7d',
+      },
     });
     restore = mock.restore;
 
@@ -370,6 +387,7 @@ describe('TopicsResource', () => {
     assert.equal(url.searchParams.get('period'), '7d');
     assert.equal(url.searchParams.get('limit'), '20');
     assert.equal(result.topics.length, 1);
+    assert.equal(result.topics[0].occurrences, 500);
   });
 
   it('getTrending() works without params', async () => {
@@ -393,27 +411,45 @@ describe('EntitiesResource', () => {
 
   it('search() calls GET /entities/search', async () => {
     const mock = mockFetch({
-      body: { entities: [{ entity_id: 'en_1', entity_name: 'Elon Musk' }], pagination: {} },
+      body: {
+        entities: [
+          {
+            entity_id: 'en_1',
+            entity_name: 'Google',
+            entity_type: 'organization',
+            appearances: { total_count: 1177 },
+          },
+        ],
+        pagination: { total: 1 },
+        filters: {},
+      },
     });
     restore = mock.restore;
 
     const resource = new EntitiesResource(makeHttp());
     const result = await resource.search({
-      query: 'Elon',
-      entity_type: 'person',
-      min_appearances: 100,
+      query: 'Google',
+      entity_type: 'organization',
+      per_page: 1,
     });
 
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/entities/search');
-    assert.equal(url.searchParams.get('query'), 'Elon');
-    assert.equal(url.searchParams.get('entity_type'), 'person');
-    assert.equal(result.entities[0].entity_name, 'Elon Musk');
+    assert.equal(url.searchParams.get('query'), 'Google');
+    assert.equal(url.searchParams.get('entity_type'), 'organization');
+    assert.equal(result.entities[0].entity_name, 'Google');
   });
 
   it('get() calls GET /entities/:id', async () => {
     const mock = mockFetch({
-      body: { entity: { entity_id: 'en_abc', total_appearances: 500 } },
+      body: {
+        entity: {
+          entity_id: 'en_abc',
+          entity_name: 'Google',
+          entity_type: 'organization',
+          appearances: { total_count: 500 },
+        },
+      },
     });
     restore = mock.restore;
 
@@ -427,13 +463,16 @@ describe('EntitiesResource', () => {
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/entities/en_abc');
     assert.equal(url.searchParams.get('with_appearances'), 'true');
-    assert.equal(url.searchParams.get('appearances_limit'), '10');
-    assert.equal(result.entity.total_appearances, 500);
+    assert.equal(result.entity.entity_name, 'Google');
   });
 
   it('getAppearances() calls GET /entities/:id/appearances', async () => {
     const mock = mockFetch({
-      body: { appearances: [], pagination: { total: 0 } },
+      body: {
+        entity: { entity_id: 'en_abc' },
+        appearances: [],
+        pagination: { total: 0 },
+      },
     });
     restore = mock.restore;
 
@@ -449,7 +488,6 @@ describe('EntitiesResource', () => {
     assert.equal(url.pathname, '/api/v1/entities/en_abc/appearances');
     assert.equal(url.searchParams.get('role'), 'guest');
     assert.equal(url.searchParams.get('from'), '2026-01-01');
-    assert.equal(url.searchParams.get('order_dir'), 'desc');
     assert.equal(url.searchParams.has('entity_id'), false);
   });
 });
@@ -464,20 +502,22 @@ describe('ListsResource', () => {
 
   it('list() calls GET /lists', async () => {
     const mock = mockFetch({
-      body: { lists: [{ list_id: 'cl_1' }], pagination: { total: 1 } },
+      body: {
+        lists: [{ list_id: 'cl_1', list_name: 'Research' }],
+        pagination: { total: 1 },
+      },
     });
     restore = mock.restore;
 
     const resource = new ListsResource(makeHttp());
     const result = await resource.list({ page: 1, per_page: 10 });
 
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/lists');
+    assert.equal(new URL(mock.captured[0].url).pathname, '/api/v1/lists');
     assert.equal(result.lists.length, 1);
   });
 
   it('list() works without params', async () => {
-    const mock = mockFetch({ body: { lists: [], pagination: {} } });
+    const mock = mockFetch({ body: { lists: [], pagination: { total: 0 } } });
     restore = mock.restore;
 
     const resource = new ListsResource(makeHttp());
@@ -488,15 +528,12 @@ describe('ListsResource', () => {
 
   it('getItems() calls GET /lists/:id/items', async () => {
     const mock = mockFetch({
-      body: { items: [{ id: 'pd_1', type: 'podcast' }], pagination: {} },
+      body: { items: [{ id: 'pd_1', type: 'podcast' }], pagination: { total: 1 } },
     });
     restore = mock.restore;
 
     const resource = new ListsResource(makeHttp());
-    const result = await resource.getItems({
-      list_id: 'cl_abc',
-      item_type: 'podcasts',
-    });
+    const result = await resource.getItems({ list_id: 'cl_abc', item_type: 'podcasts' });
 
     const url = new URL(mock.captured[0].url);
     assert.equal(url.pathname, '/api/v1/lists/cl_abc/items');
@@ -512,10 +549,7 @@ describe('ListsResource', () => {
     restore = mock.restore;
 
     const resource = new ListsResource(makeHttp());
-    const result = await resource.addItems({
-      list_id: 'cl_abc',
-      item_ids: 'pd_1,ep_2',
-    });
+    const result = await resource.addItems({ list_id: 'cl_abc', item_ids: 'pd_1,ep_2' });
 
     assert.equal(mock.captured[0].method, 'POST');
     assert.equal(new URL(mock.captured[0].url).pathname, '/api/v1/lists/cl_abc/items');
@@ -524,39 +558,6 @@ describe('ListsResource', () => {
     assert.equal(body.list_id, undefined);
     assert.equal(result.success, true);
     assert.equal(result.summary.added, 2);
-  });
-});
-
-// ==========================================================================
-// Charts Resource (1 endpoint)
-// ==========================================================================
-
-describe('ChartsResource', () => {
-  let restore: () => void;
-  afterEach(() => restore?.());
-
-  it('get() calls GET /charts with platform and options', async () => {
-    const mock = mockFetch({
-      body: { charts: [{ position: 1, podcast_id: 'pd_top' }] },
-    });
-    restore = mock.restore;
-
-    const resource = new ChartsResource(makeHttp());
-    const result = await resource.get({
-      platform: 'apple',
-      chart_type: 'top',
-      country: 'us',
-      limit: 50,
-    });
-
-    const url = new URL(mock.captured[0].url);
-    assert.equal(url.pathname, '/api/v1/charts');
-    assert.equal(url.searchParams.get('platform'), 'apple');
-    assert.equal(url.searchParams.get('chart_type'), 'top');
-    assert.equal(url.searchParams.get('country'), 'us');
-    assert.equal(url.searchParams.get('limit'), '50');
-    assert.equal(result.charts.length, 1);
-    assert.equal(result.charts[0].position, 1);
   });
 });
 

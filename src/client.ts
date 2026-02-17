@@ -5,7 +5,6 @@ import { AlertsResource } from './resources/alerts.js';
 import { TopicsResource } from './resources/topics.js';
 import { EntitiesResource } from './resources/entities.js';
 import { ListsResource } from './resources/lists.js';
-import { ChartsResource } from './resources/charts.js';
 import { PublishersResource } from './resources/publishers.js';
 import type { RateLimitInfo } from './http.js';
 
@@ -21,9 +20,9 @@ export interface PodscanClientOptions {
 export class PodscanClient {
   private readonly http: HttpClient;
 
-  /** Search and retrieve podcast episodes, transcripts, and recent content. */
+  /** Search and retrieve podcast episodes and recent content. */
   readonly episodes: EpisodesResource;
-  /** Search and retrieve podcast metadata, reviews, demographics, and similar shows. */
+  /** Search and retrieve podcast metadata. */
   readonly podcasts: PodcastsResource;
   /** Create and manage keyword monitoring alerts and their mentions. */
   readonly alerts: AlertsResource;
@@ -33,8 +32,6 @@ export class PodscanClient {
   readonly entities: EntitiesResource;
   /** Manage curated collections of podcasts, episodes, entities, and topics. */
   readonly lists: ListsResource;
-  /** Access Apple Podcasts and Spotify chart rankings. */
-  readonly charts: ChartsResource;
   /** Retrieve publisher information and podcast portfolios. */
   readonly publishers: PublishersResource;
 
@@ -47,7 +44,6 @@ export class PodscanClient {
     this.topics = new TopicsResource(this.http);
     this.entities = new EntitiesResource(this.http);
     this.lists = new ListsResource(this.http);
-    this.charts = new ChartsResource(this.http);
     this.publishers = new PublishersResource(this.http);
   }
 

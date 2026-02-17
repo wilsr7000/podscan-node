@@ -3,10 +3,12 @@
 // ---------------------------------------------------------------------------
 
 export interface Pagination {
-  page: number;
-  per_page: number;
   total: number;
-  has_more: boolean;
+  per_page: number;
+  current_page: number;
+  last_page: number;
+  from: number | null;
+  to: number | null;
 }
 
 export interface Quota {
@@ -29,83 +31,174 @@ export type SortDirection = 'asc' | 'desc';
 // Core domain objects
 // ---------------------------------------------------------------------------
 
-export interface PodcastSummary {
-  podcast_id: string;
-  podcast_name: string;
-  description?: string;
-  website?: string;
-  rss_feed?: string;
-  language?: string;
-  categories?: Category[];
-  audience_size_estimate?: number;
-  itunes_rating?: number;
-  spotify_rating?: number;
-  episode_count?: number;
-  last_posted_at?: string;
-}
-
-export interface Podcast extends PodcastSummary {
-  authors?: string;
-  publisher?: PublisherSummary;
-  demographics?: Demographics;
-  recent_episodes?: Episode[];
-  reviews?: ReviewSummary;
-}
-
-export interface Episode {
-  episode_id: string;
-  episode_title: string;
-  posted_at: string;
-  duration: number;
-  summary?: string;
-  podcast?: PodcastSummary;
-  transcript?: string;
-  hosts?: EntitySummary[];
-  guests?: EntitySummary[];
-  sponsors?: EntitySummary[];
-  topics?: TopicOccurrence[];
-  _search_highlight?: string;
-}
-
 export interface Category {
   category_id: string;
   category_name: string;
 }
 
-export interface PublisherSummary {
-  publisher_id: string;
-  publisher_name: string;
+export interface SearchHighlight {
+  transcription?: string;
+  description?: string;
+  title?: string;
 }
 
-export interface Publisher extends PublisherSummary {
-  website?: string;
-  podcasts?: PodcastSummary[];
+// -- Podcasts ---------------------------------------------------------------
+
+export interface PodcastRef {
+  podcast_id: string;
+  podcast_name: string;
+  podcast_url?: string;
+  podcast_reach_score?: number;
 }
+
+export interface Podcast {
+  podcast_id: string;
+  podcast_guid: string;
+  podcast_name: string;
+  podcast_url: string;
+  podcast_description: string;
+  podcast_image_url: string | null;
+  podcast_categories: Category[];
+  podcast_iab_categories: string[] | null;
+  podcast_has_guests: boolean | null;
+  podcast_has_sponsors: boolean | null;
+  podcast_itunes_id: string | null;
+  podcast_spotify_id: string | null;
+  podcast_reach_score: number;
+  publisher_name: string | null;
+  publisher_ids: string[] | null;
+  brand_safety: string | null;
+  reach: Record<string, unknown> | null;
+  rss_url: string | null;
+  is_active: boolean;
+  episode_count: number;
+  episodes_in_database: number;
+  language: string | null;
+  region: string | null;
+  last_posted_at: string | null;
+  last_scanned_at: string | null;
+  created_at: string;
+  updated_at: string;
+  is_duplicate: boolean;
+  is_duplicate_of: string | null;
+  _search_highlight?: SearchHighlight;
+}
+
+// -- Episode metadata (hosts, guests, speakers, summaries) ------------------
+
+export interface HostInfo {
+  host_name: string;
+  host_company: string | null;
+  host_social_media_links: string[] | null;
+  speaker_label: string | null;
+}
+
+export interface GuestInfo {
+  guest_name: string;
+  guest_company: string | null;
+  guest_social_media_links: string[] | null;
+  guest_industry: string | null;
+  guest_occupation: string | null;
+  speaker_label: string | null;
+}
+
+export interface SponsorInfo {
+  sponsor_name: string;
+  sponsor_url: string | null;
+  sponsor_description: string | null;
+}
+
+export interface FirstOccurrence {
+  type: 'host' | 'guest' | 'keyword' | 'sponsor';
+  value: string;
+  first_occurence: string;
+}
+
+export interface EpisodeMetadata {
+  hosts: HostInfo[];
+  guests: GuestInfo[];
+  sponsors: SponsorInfo[];
+  /** Maps speaker labels (e.g. "SPEAKER_01") to real names. */
+  speakers: Record<string, string>;
+  has_hosts: boolean;
+  has_guests: boolean;
+  has_sponsors: boolean;
+  is_branded: boolean;
+  is_branded_confidence_score: number;
+  is_branded_confidence_reason: string | null;
+  summary_short: string | null;
+  summary_long: string | null;
+  summary_keywords: string[];
+  first_occurences: FirstOccurrence[];
+  brand_safety: string | null;
+}
+
+// -- Episodes ---------------------------------------------------------------
+
+export interface Episode {
+  episode_fully_processed: boolean;
+  episode_id: string;
+  episode_guid: string;
+  episode_title: string;
+  episode_url: string;
+  episode_audio_url: string | null;
+  episode_image_url: string | null;
+  episode_duration: number;
+  episode_word_count: number;
+  episode_categories: Category[];
+  episode_iab_category: string | null;
+  episode_has_guests: boolean | null;
+  episode_has_sponsors: boolean | null;
+  created_at: string;
+  updated_at: string;
+  posted_at: string;
+  episode_transcript: string | null;
+  episode_transcript_word_level_timestamps: unknown;
+  episode_description: string;
+  episode_permalink: string;
+  podcast: PodcastRef;
+  metadata: EpisodeMetadata | null;
+  topics: TopicOccurrence[];
+  _search_highlight?: SearchHighlight;
+}
+
+// -- Topics -----------------------------------------------------------------
 
 export interface TopicSummary {
   topic_id: string;
-  topic_name: string;
+  name: string;
+  occurrences_count?: number;
+  latest_occurrence?: string;
 }
 
-export interface TopicOccurrence extends TopicSummary {
+export interface TopicOccurrence {
+  topic_id: string;
+  name?: string;
+  topic_name?: string;
   topic_name_normalized?: string;
   sentiment?: Sentiment;
 }
 
-export interface Topic extends TopicSummary {
-  topic_name_normalized: string;
+export interface TopicMomentum {
+  daily_growth: number;
+  weekly_growth: number;
+  is_trending: boolean;
+  current_velocity?: {
+    occurrences_last_hour: number;
+    occurrences_last_day: number;
+    occurrences_last_week: number;
+  };
+}
+
+export interface Topic {
+  topic_id: string;
+  name: string;
   occurrences_count: number;
   latest_occurrence: string;
-  momentum?: Record<string, unknown>;
+  momentum?: TopicMomentum;
   recent_occurrences?: TopicEpisodeOccurrence[];
   related_topics?: TopicSummary[];
   lists?: ListSummary[];
-  history?: TopicHistory[];
-}
-
-export interface TopicHistory {
-  date: string;
-  count: number;
 }
 
 export interface TopicEpisodeOccurrence {
@@ -117,33 +210,41 @@ export interface TopicEpisodeOccurrence {
   sentiment?: Sentiment;
 }
 
-export interface EntitySummary {
+export interface TrendingTopic {
+  topic_id: string;
+  name: string;
+  occurrences: number;
+  momentum?: TopicMomentum;
+  related_topics?: TopicSummary[];
+}
+
+// -- Entities ---------------------------------------------------------------
+
+export interface EntityAppearanceCounts {
+  hosts_count: number;
+  guests_count: number;
+  sponsors_count: number;
+  producers_count: number;
+  mentions_count: number;
+  total_count: number;
+}
+
+export interface Entity {
   entity_id: string;
   entity_name: string;
   entity_type: 'person' | 'organization';
-}
-
-export interface Entity extends EntitySummary {
-  url?: string;
-  company?: string;
-  occupation?: string;
-  industry?: string;
-  social_links?: Record<string, string>;
-  total_appearances: number;
-  appearance_counts: AppearanceCounts;
-  recent_appearances?: EntityAppearance[];
-}
-
-export interface AppearanceCounts {
-  host?: number;
-  guest?: number;
-  sponsor?: number;
-  producer?: number;
-  mention?: number;
+  created_at: string;
+  updated_at: string;
+  company: string | null;
+  occupation: string | null;
+  industry: string | null;
+  url: string | null;
+  appearances: EntityAppearanceCounts;
+  _search_highlight?: SearchHighlight;
 }
 
 export interface EntityAppearance {
-  appearance_id: string;
+  appearance_id?: string;
   role: string;
   episode_id: string;
   episode_title: string;
@@ -151,6 +252,8 @@ export interface EntityAppearance {
   podcast_name: string;
   posted_at: string;
 }
+
+// -- Alerts -----------------------------------------------------------------
 
 export interface Alert {
   alert_id: string;
@@ -171,6 +274,8 @@ export interface Mention {
   episode?: Episode;
 }
 
+// -- Lists ------------------------------------------------------------------
+
 export interface ListSummary {
   list_id: string;
   list_name: string;
@@ -186,52 +291,20 @@ export interface ListItem {
   [key: string]: unknown;
 }
 
-export interface ChartEntry {
-  position: number;
-  previous_position?: number;
-  position_change?: number;
-  weeks_on_chart?: number;
-  podcast_id: string;
-  podcast_name: string;
-}
+// -- Publishers -------------------------------------------------------------
 
-export interface ReviewSummary {
-  podcast_id: string;
-  podcast_name: string;
-  itunes_rating_average?: number;
-  itunes_rating_count?: number;
-  spotify_rating_average?: number;
-  spotify_rating_count?: number;
-  combined_rating?: number;
-  rating_trend?: string;
-}
-
-export interface Demographics {
-  language?: string;
-  region?: string;
-  audience_size_estimate?: number;
-  [key: string]: unknown;
-}
-
-export interface TrendingTopic extends TopicSummary {
-  mention_count: number;
-  growth_rate: number;
-  top_episodes?: Episode[];
+export interface Publisher {
+  publisher_id: string;
+  publisher_name: string;
+  website?: string;
+  podcasts?: Podcast[];
 }
 
 // ---------------------------------------------------------------------------
-// Paginated / list response wrappers
+// Request params
 // ---------------------------------------------------------------------------
 
-export interface PaginatedResponse {
-  pagination: Pagination;
-  quota?: Quota;
-  [key: string]: unknown;
-}
-
-// ---------------------------------------------------------------------------
-// Search Episodes
-// ---------------------------------------------------------------------------
+// -- Episodes ---------------------------------------------------------------
 
 export interface SearchEpisodesParams {
   query: string;
@@ -255,51 +328,12 @@ export interface SearchEpisodesParams {
   transcript_formatter?: 'raw' | 'paragraphs';
 }
 
-export interface SearchEpisodesResponse {
-  episodes: Episode[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Episode
-// ---------------------------------------------------------------------------
-
 export interface GetEpisodeParams {
   episode_id: string;
   include_transcript?: boolean;
   include_topics?: boolean;
   include_entities?: boolean;
 }
-
-export interface GetEpisodeResponse {
-  episode: Episode;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Episode Transcript
-// ---------------------------------------------------------------------------
-
-export interface GetEpisodeTranscriptParams {
-  episode_id: string;
-  format?: 'plain' | 'timestamped';
-  search?: string;
-}
-
-export interface GetEpisodeTranscriptResponse {
-  episode_id: string;
-  episode_title: string;
-  transcript: string;
-  word_count: number;
-  duration: number;
-  matches?: string[];
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Recent Episodes
-// ---------------------------------------------------------------------------
 
 export interface GetRecentEpisodesParams {
   limit?: number;
@@ -317,17 +351,6 @@ export interface GetRecentEpisodesParams {
   remove_speaker_labels?: boolean;
   transcript_formatter?: 'raw' | 'paragraphs';
 }
-
-export interface GetRecentEpisodesResponse {
-  episodes: Episode[];
-  count: number;
-  filters?: Record<string, unknown>;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Podcast Episodes
-// ---------------------------------------------------------------------------
 
 export interface GetPodcastEpisodesParams {
   podcast_id: string;
@@ -348,19 +371,7 @@ export interface GetPodcastEpisodesParams {
   transcript_formatter?: 'raw' | 'paragraphs';
 }
 
-export interface GetPodcastEpisodesResponse {
-  podcast_id: string;
-  podcast_name: string;
-  episodes: Episode[];
-  pagination: Pagination;
-  sort?: { field: string; direction: SortDirection };
-  filters?: Record<string, unknown>;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Search Podcasts
-// ---------------------------------------------------------------------------
+// -- Podcasts ---------------------------------------------------------------
 
 export interface SearchPodcastsParams {
   query: string;
@@ -379,16 +390,6 @@ export interface SearchPodcastsParams {
   per_page?: number;
 }
 
-export interface SearchPodcastsResponse {
-  podcasts: PodcastSummary[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Podcast
-// ---------------------------------------------------------------------------
-
 export interface GetPodcastParams {
   podcast_id: string;
   include_episodes?: boolean;
@@ -397,63 +398,7 @@ export interface GetPodcastParams {
   include_reviews?: boolean;
 }
 
-export interface GetPodcastResponse {
-  podcast: Podcast;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Similar Podcasts
-// ---------------------------------------------------------------------------
-
-export interface GetSimilarPodcastsParams {
-  podcast_id: string;
-  limit?: number;
-}
-
-export interface GetSimilarPodcastsResponse {
-  podcast_id: string;
-  podcasts: PodcastSummary[];
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Podcast Reviews
-// ---------------------------------------------------------------------------
-
-export interface GetPodcastReviewsParams {
-  podcast_id: string;
-}
-
-export interface GetPodcastReviewsResponse {
-  reviews: ReviewSummary;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Podcast Demographics
-// ---------------------------------------------------------------------------
-
-export interface GetPodcastDemographicsParams {
-  language?: string;
-  region?: string;
-  category_ids?: string;
-  min_audience_size?: number;
-  max_audience_size?: number;
-  order_by?: string;
-  page?: number;
-  per_page?: number;
-}
-
-export interface GetPodcastDemographicsResponse {
-  podcasts: PodcastSummary[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Search People & Brands
-// ---------------------------------------------------------------------------
+// -- Entities ---------------------------------------------------------------
 
 export interface SearchEntitiesParams {
   query: string;
@@ -465,30 +410,11 @@ export interface SearchEntitiesParams {
   per_page?: number;
 }
 
-export interface SearchEntitiesResponse {
-  entities: EntitySummary[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Entity
-// ---------------------------------------------------------------------------
-
 export interface GetEntityParams {
   entity_id: string;
   with_appearances?: boolean;
   appearances_limit?: number;
 }
-
-export interface GetEntityResponse {
-  entity: Entity;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Entity Appearances
-// ---------------------------------------------------------------------------
 
 export interface GetEntityAppearancesParams {
   entity_id: string;
@@ -502,21 +428,7 @@ export interface GetEntityAppearancesParams {
   order_dir?: SortDirection;
 }
 
-export interface GetEntityAppearancesResponse {
-  entity_id: string;
-  entity_name: string;
-  entity_type: string;
-  total_appearances: number;
-  appearances: EntityAppearance[];
-  pagination: Pagination;
-  sort?: { field: string; direction: SortDirection };
-  filters?: Record<string, unknown>;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Search Topics
-// ---------------------------------------------------------------------------
+// -- Topics -----------------------------------------------------------------
 
 export interface SearchTopicsParams {
   query: string;
@@ -527,29 +439,10 @@ export interface SearchTopicsParams {
   per_page?: number;
 }
 
-export interface SearchTopicsResponse {
-  topics: TopicSummary[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Topic
-// ---------------------------------------------------------------------------
-
 export interface GetTopicParams {
   topic_id: string;
   with_history?: boolean;
 }
-
-export interface GetTopicResponse {
-  topic: Topic;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Topic Episodes
-// ---------------------------------------------------------------------------
 
 export interface GetTopicEpisodesParams {
   topic_id: string;
@@ -566,49 +459,19 @@ export interface GetTopicEpisodesParams {
   transcript_formatter?: 'raw' | 'paragraphs';
 }
 
-export interface GetTopicEpisodesResponse {
-  topic_id: string;
-  topic_name: string;
-  episodes: Episode[];
-  pagination: Pagination;
-  filters?: Record<string, unknown>;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Trending Topics
-// ---------------------------------------------------------------------------
-
 export interface GetTrendingTopicsParams {
   period?: '24h' | '7d' | '30d';
   limit?: number;
   category?: string;
 }
 
-export interface GetTrendingTopicsResponse {
-  topics: TrendingTopic[];
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// List Alerts
-// ---------------------------------------------------------------------------
+// -- Alerts -----------------------------------------------------------------
 
 export interface ListAlertsParams {
   enabled_only?: boolean;
   page?: number;
   per_page?: number;
 }
-
-export interface ListAlertsResponse {
-  alerts: Alert[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Alert Mentions
-// ---------------------------------------------------------------------------
 
 export interface GetAlertMentionsParams {
   alert_id: string;
@@ -617,16 +480,6 @@ export interface GetAlertMentionsParams {
   page?: number;
   per_page?: number;
 }
-
-export interface GetAlertMentionsResponse {
-  mentions: Mention[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Create Alert
-// ---------------------------------------------------------------------------
 
 export interface CreateAlertParams {
   name: string;
@@ -639,29 +492,12 @@ export interface CreateAlertParams {
   enabled?: boolean;
 }
 
-export interface CreateAlertResponse {
-  alert: Alert;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// List User Lists
-// ---------------------------------------------------------------------------
+// -- Lists ------------------------------------------------------------------
 
 export interface ListUserListsParams {
   page?: number;
   per_page?: number;
 }
-
-export interface ListUserListsResponse {
-  lists: ListSummary[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get List Items
-// ---------------------------------------------------------------------------
 
 export interface GetListItemsParams {
   list_id: string;
@@ -670,19 +506,119 @@ export interface GetListItemsParams {
   per_page?: number;
 }
 
-export interface GetListItemsResponse {
-  items: ListItem[];
-  pagination: Pagination;
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Add to List
-// ---------------------------------------------------------------------------
-
 export interface AddToListParams {
   list_id: string;
   item_ids: string;
+}
+
+// -- Publishers -------------------------------------------------------------
+
+export interface GetPublisherParams {
+  publisher_id: string;
+  include_podcasts?: boolean;
+  podcast_limit?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Response types
+// ---------------------------------------------------------------------------
+
+// -- Episodes ---------------------------------------------------------------
+
+export interface SearchEpisodesResponse {
+  episodes: Episode[];
+  pagination: Pagination;
+}
+
+export interface GetEpisodeResponse {
+  episode: Episode;
+}
+
+export interface GetRecentEpisodesResponse {
+  episodes: Episode[];
+}
+
+export interface GetPodcastEpisodesResponse {
+  episodes: Episode[];
+  pagination: Pagination;
+}
+
+// -- Podcasts ---------------------------------------------------------------
+
+export interface SearchPodcastsResponse {
+  podcasts: Podcast[];
+  pagination: Pagination;
+}
+
+export interface GetPodcastResponse {
+  podcast: Podcast;
+}
+
+// -- Entities ---------------------------------------------------------------
+
+export interface SearchEntitiesResponse {
+  entities: Entity[];
+  pagination: Pagination;
+  filters?: Record<string, unknown>;
+}
+
+export interface GetEntityResponse {
+  entity: Entity;
+}
+
+export interface GetEntityAppearancesResponse {
+  entity: Entity;
+  appearances: EntityAppearance[];
+  pagination: Pagination;
+}
+
+// -- Topics -----------------------------------------------------------------
+
+export interface SearchTopicsResponse {
+  topics: TopicSummary[];
+  pagination: Pagination;
+}
+
+export interface GetTopicResponse {
+  topic: Topic;
+}
+
+export interface GetTopicEpisodesResponse {
+  episodes: Episode[];
+  pagination: Pagination;
+}
+
+export interface GetTrendingTopicsResponse {
+  topics: TrendingTopic[];
+  timeframe?: string;
+}
+
+// -- Alerts -----------------------------------------------------------------
+
+export interface ListAlertsResponse {
+  alerts: Alert[];
+  pagination: Pagination;
+}
+
+export interface GetAlertMentionsResponse {
+  mentions: Mention[];
+  pagination: Pagination;
+}
+
+export interface CreateAlertResponse {
+  alert: Alert;
+}
+
+// -- Lists ------------------------------------------------------------------
+
+export interface ListUserListsResponse {
+  lists: ListSummary[];
+  pagination: Pagination;
+}
+
+export interface GetListItemsResponse {
+  items: ListItem[];
+  pagination: Pagination;
 }
 
 export interface AddToListResponse {
@@ -691,37 +627,34 @@ export interface AddToListResponse {
   added: string[];
   skipped: string[];
   failed: { id: string; reason: string }[];
-  quota?: Quota;
 }
 
-// ---------------------------------------------------------------------------
-// Get Charts
-// ---------------------------------------------------------------------------
-
-export interface GetChartsParams {
-  platform: 'apple' | 'spotify';
-  chart_type?: 'top' | 'new' | 'trending';
-  category?: string;
-  country?: string;
-  limit?: number;
-}
-
-export interface GetChartsResponse {
-  charts: ChartEntry[];
-  quota?: Quota;
-}
-
-// ---------------------------------------------------------------------------
-// Get Publisher
-// ---------------------------------------------------------------------------
-
-export interface GetPublisherParams {
-  publisher_id: string;
-  include_podcasts?: boolean;
-  podcast_limit?: number;
-}
+// -- Publishers -------------------------------------------------------------
 
 export interface GetPublisherResponse {
   publisher: Publisher;
-  quota?: Quota;
+}
+
+// ---------------------------------------------------------------------------
+// Time period helpers
+// ---------------------------------------------------------------------------
+
+/** A date range that can be spread into any search params with `since`/`before`. */
+export interface DateRange {
+  since: string;
+  before?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Pagination / sync helpers
+// ---------------------------------------------------------------------------
+
+/** Checkpoint for delta/incremental sync workflows. */
+export interface Checkpoint {
+  /** ISO 8601 timestamp of the most recent item seen. */
+  lastSeenAt: string;
+  /** ID of the most recent item seen. */
+  lastSeenId: string;
+  /** Total number of items iterated. */
+  totalSeen: number;
 }

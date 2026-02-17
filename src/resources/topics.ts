@@ -1,5 +1,8 @@
 import type { HttpClient } from '../http.js';
+import { Paginator } from '../paginator.js';
 import type {
+  Episode,
+  TopicSummary,
   SearchTopicsParams,
   SearchTopicsResponse,
   GetTopicParams,
@@ -21,6 +24,16 @@ export class TopicsResource {
   }
 
   /**
+   * Auto-paginating search that yields every matching topic across all pages.
+   */
+  searchAll(params: Omit<SearchTopicsParams, 'page'>): Paginator<TopicSummary> {
+    return new Paginator(async (page) => {
+      const res = await this.search({ ...params, page });
+      return { items: res.topics, pagination: res.pagination };
+    });
+  }
+
+  /**
    * Get detailed information about a specific topic.
    */
   async get(params: GetTopicParams): Promise<GetTopicResponse> {
@@ -34,6 +47,16 @@ export class TopicsResource {
   async getEpisodes(params: GetTopicEpisodesParams): Promise<GetTopicEpisodesResponse> {
     const { topic_id, ...query } = params;
     return this.http.get<GetTopicEpisodesResponse>(`/topics/${topic_id}/episodes`, query);
+  }
+
+  /**
+   * Auto-paginating version of `getEpisodes()` that yields every episode for a topic.
+   */
+  getEpisodesAll(params: Omit<GetTopicEpisodesParams, 'page'>): Paginator<Episode> {
+    return new Paginator(async (page) => {
+      const res = await this.getEpisodes({ ...params, page });
+      return { items: res.episodes, pagination: res.pagination };
+    });
   }
 
   /**

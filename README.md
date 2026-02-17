@@ -4,7 +4,10 @@ Lightweight, zero-dependency TypeScript SDK for the [Podscan REST API](https://p
 
 - **Zero runtime dependencies** -- uses native `fetch` (Node 18+)
 - **Dual format** -- ESM and CommonJS
-- **Fully typed** -- complete TypeScript definitions for all 25 API endpoints
+- **Fully typed** -- complete TypeScript definitions including episode metadata (hosts, guests, speakers)
+- **Auto-pagination** -- `searchAll()` async iterators walk all pages automatically
+- **Time period helpers** -- `periods.thisWeek()`, `periods.lastMonth()`, etc.
+- **Delta sync** -- checkpoint-based tracking for incremental data pulls
 - **Tiny** -- under 10 KB minified (ESM)
 
 ## Install
@@ -80,7 +83,6 @@ All methods return typed promises. Parameters mirror the [Podscan API docs](http
 |---|---|
 | `search(params)` | Full-text search across episode transcripts, titles, and descriptions |
 | `get(params)` | Get detailed info about a specific episode |
-| `getTranscript(params)` | Get the full transcript of an episode |
 | `getRecent(params?)` | Get the most recently published episodes |
 | `getByPodcast(params)` | List all episodes for a specific podcast |
 
@@ -95,18 +97,11 @@ const results = await client.episodes.search({
   per_page: 25,
 });
 
-// Get episode details with transcript and entities
+// Get episode details with transcript
 const episode = await client.episodes.get({
   episode_id: 'ep_m9v2x7kq4pn8rjsw',
   include_transcript: true,
   include_entities: true,
-});
-
-// Get transcript with search highlighting
-const transcript = await client.episodes.getTranscript({
-  episode_id: 'ep_m9v2x7kq4pn8rjsw',
-  format: 'timestamped',
-  search: 'artificial intelligence',
 });
 
 // Get recent episodes
@@ -126,9 +121,6 @@ const podcastEpisodes = await client.episodes.getByPodcast({
 |---|---|
 | `search(params)` | Search podcasts by name, topic, or characteristics |
 | `get(params)` | Get detailed info about a specific podcast |
-| `getSimilar(params)` | Find podcasts similar to a given podcast |
-| `getReviews(params)` | Get aggregated review and rating data |
-| `getDemographics(params?)` | Search podcasts by audience demographics |
 
 ```typescript
 // Search podcasts
@@ -139,23 +131,11 @@ const podcasts = await client.podcasts.search({
   order_by: 'audience_size',
 });
 
-// Get podcast with episodes and demographics
+// Get podcast details
 const podcast = await client.podcasts.get({
   podcast_id: 'pd_ka86x53ynan9wgdv',
   include_episodes: true,
   episode_limit: 5,
-  include_demographics: true,
-});
-
-// Find similar podcasts
-const similar = await client.podcasts.getSimilar({
-  podcast_id: 'pd_ka86x53ynan9wgdv',
-  limit: 10,
-});
-
-// Get reviews
-const reviews = await client.podcasts.getReviews({
-  podcast_id: 'pd_ka86x53ynan9wgdv',
 });
 ```
 
@@ -202,7 +182,7 @@ const topics = await client.topics.search({
   min_episodes: 100,
 });
 
-// Get topic with 30-day history
+// Get topic with history
 const topic = await client.topics.get({
   topic_id: 'tp_z8x6c4v2b0n9m7k5',
   with_history: true,
@@ -275,21 +255,6 @@ const result = await client.lists.addItems({
 });
 ```
 
-### `client.charts`
-
-| Method | Description |
-|---|---|
-| `get(params)` | Get podcast chart rankings from Apple Podcasts and Spotify |
-
-```typescript
-const charts = await client.charts.get({
-  platform: 'apple',
-  chart_type: 'top',
-  country: 'us',
-  limit: 50,
-});
-```
-
 ### `client.publishers`
 
 | Method | Description |
@@ -301,6 +266,169 @@ const publisher = await client.publishers.get({
   publisher_id: 'pb_l7k5j3h1g9f6d4s2',
   include_podcasts: true,
   podcast_limit: 20,
+});
+```
+
+## Time Periods
+
+The `periods` helper computes date ranges you can spread into any search call:
+
+```typescript
+import { PodscanClient, periods } from 'podscan';
+
+const client = new PodscanClient({ apiKey: process.env.PODSCAN_API_KEY! });
+
+// This week's AI episodes
+const results = await client.episodes.search({
+  query: 'AI',
+  ...periods.thisWeek(),
+  per_page: 50,
+});
+```
+
+Available presets:
+
+| Method | Range |
+|---|---|
+| `periods.today()` | Midnight UTC today to now |
+| `periods.yesterday()` | Yesterday midnight to today midnight |
+| `periods.last24Hours()` | Rolling 24-hour window |
+| `periods.thisWeek()` | Monday 00:00 UTC to now |
+| `periods.lastWeek()` | Previous Monday to this Monday |
+| `periods.thisMonth()` | 1st of month to now |
+| `periods.lastMonth()` | 1st of last month to 1st of this month |
+| `periods.lastNDays(n)` | Rolling N-day window |
+| `periods.lastNHours(n)` | Rolling N-hour window |
+| `periods.since(date)` | Everything after a Date or ISO string |
+
+All dates are UTC ISO 8601 strings. Each returns `{ since, before? }`.
+
+## Auto-Pagination
+
+Every paginated resource has a `searchAll()` method that returns an async iterator, walking all pages automatically:
+
+```typescript
+// Iterate every matching episode across all pages
+for await (const episode of client.episodes.searchAll({
+  query: 'artificial intelligence',
+  ...periods.thisWeek(),
+  has_guests: true,
+})) {
+  console.log(episode.episode_title);
+  console.log('  Guests:', episode.metadata?.guests.map(g => g.guest_name).join(', '));
+}
+```
+
+Available auto-paginating methods:
+
+| Resource | Method | Yields |
+|---|---|---|
+| `client.episodes` | `searchAll(params)` | `Episode` |
+| `client.episodes` | `getByPodcastAll(params)` | `Episode` |
+| `client.podcasts` | `searchAll(params)` | `Podcast` |
+| `client.topics` | `searchAll(params)` | `TopicSummary` |
+| `client.topics` | `getEpisodesAll(params)` | `Episode` |
+| `client.entities` | `searchAll(params)` | `Entity` |
+
+## Delta Sync (Checkpoints)
+
+Track what you've already pulled so the next run only fetches new content:
+
+```typescript
+import { PodscanClient, periods } from 'podscan';
+
+const client = new PodscanClient({ apiKey: process.env.PODSCAN_API_KEY! });
+
+// First run: pull this week's episodes
+const paginator = client.episodes.searchAll({
+  query: 'AI',
+  ...periods.thisWeek(),
+});
+
+for await (const episode of paginator) {
+  await saveToDatabase(episode);
+}
+
+// Save checkpoint
+const checkpoint = paginator.checkpoint();
+// { lastSeenAt: '2026-02-16T14:30:00Z', lastSeenId: 'ep_abc123', totalSeen: 142 }
+await saveCheckpoint(checkpoint);
+
+// Next run: only get new episodes since last checkpoint
+const lastCheckpoint = await loadCheckpoint();
+const newEpisodes = client.episodes.searchAll({
+  query: 'AI',
+  since: lastCheckpoint.lastSeenAt,
+});
+
+for await (const episode of newEpisodes) {
+  await saveToDatabase(episode);
+}
+```
+
+## Transcripts and Guest Data
+
+Every episode includes full transcript and structured metadata with host/guest/speaker info:
+
+```typescript
+const results = await client.episodes.search({
+  query: 'machine learning',
+  has_guests: true,
+  ...periods.thisWeek(),
+  per_page: 10,
+});
+
+for (const ep of results.episodes) {
+  // Full transcript with timestamps and speaker labels
+  console.log(ep.episode_transcript);
+  // "[00:00:08] [SPEAKER_01] Welcome to the show..."
+
+  // Structured metadata
+  const meta = ep.metadata;
+  if (meta) {
+    // Hosts
+    for (const host of meta.hosts) {
+      console.log(`Host: ${host.host_name} (${host.host_company})`);
+    }
+
+    // Guests with social links and occupation
+    for (const guest of meta.guests) {
+      console.log(`Guest: ${guest.guest_name}`);
+      console.log(`  Occupation: ${guest.guest_occupation}`);
+      console.log(`  Social: ${guest.guest_social_media_links?.join(', ')}`);
+    }
+
+    // Speaker label to name mapping
+    console.log('Speakers:', meta.speakers);
+    // { "SPEAKER_01": "John Smith", "SPEAKER_02": "Jane Doe" }
+
+    // AI-generated summaries
+    console.log('Summary:', meta.summary_short);
+    console.log('Keywords:', meta.summary_keywords);
+  }
+}
+```
+
+Transcript formatting options:
+
+```typescript
+// Clean text without timestamps
+const clean = await client.episodes.search({
+  query: 'AI',
+  remove_timestamps: true,
+  remove_speaker_labels: true,
+});
+
+// Paragraphs (merges segments)
+const paragraphs = await client.episodes.search({
+  query: 'AI',
+  transcript_formatter: 'paragraphs',
+});
+
+// Exclude transcript entirely (saves bandwidth)
+const noTranscript = await client.episodes.search({
+  query: 'AI',
+  exclude_transcript: true,
 });
 ```
 
