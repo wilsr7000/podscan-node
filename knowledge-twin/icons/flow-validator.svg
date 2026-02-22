@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <g fill="none" stroke="#fff" stroke-width="1">
+    <polygon points="24,1 32,14 16,14"/>
+    <circle cx="24" cy="6" r="1.5" fill="#fff"/>
+    <line x1="20" y1="14" x2="12" y2="20"/>
+    <line x1="28" y1="14" x2="36" y2="20"/>
+    <polygon points="8,20 12,17.5 16,20 16,25 12,27.5 8,25"/>
+    <circle cx="12" cy="23" r="1.5" fill="#fff"/>
+    <polygon points="32,20 36,17.5 40,20 40,25 36,27.5 32,25"/>
+    <circle cx="36" cy="23" r="1.5" fill="#fff"/>
+    <path d="M12,27.5 Q12,34 20,36"/>
+    <path d="M36,27.5 Q36,34 28,36"/>
+    <circle cx="24" cy="38" r="8"/>
+    <circle cx="24" cy="34.5" r="4" opacity="0.6"/>
+    <circle cx="20.5" cy="40" r="4" opacity="0.6"/>
+    <circle cx="27.5" cy="40" r="4" opacity="0.6"/>
+    <circle cx="24" cy="38" r="1.5" fill="#fff"/>
+    <path d="M8,20 Q2,8 16,1" stroke-dasharray="2 2" opacity="0.4"/>
+    <path d="M40,20 Q46,8 32,1" stroke-dasharray="2 2" opacity="0.4"/>
+    <circle cx="24" cy="24" r="23" stroke-dasharray="2.5 2.5" opacity="0.25"/>
+  </g>
+</svg>

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <g fill="none" stroke="#fff" stroke-width="1">
+    <circle cx="24" cy="24" r="23"/>
+    <circle cx="24" cy="24" r="2" fill="#fff"/>
+    <line x1="24" y1="24" x2="24" y2="9.3" stroke-width="0.5"/>
+    <circle cx="24" cy="9.3" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="32.64" y2="12.11" stroke-width="0.5"/>
+    <circle cx="32.64" cy="12.11" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="37.98" y2="19.46" stroke-width="0.5"/>
+    <circle cx="37.98" cy="19.46" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="37.98" y2="28.54" stroke-width="0.5"/>
+    <circle cx="37.98" cy="28.54" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="32.64" y2="35.89" stroke-width="0.5"/>
+    <circle cx="32.64" cy="35.89" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="24" y2="38.7" stroke-width="0.5"/>
+    <circle cx="24" cy="38.7" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="15.36" y2="35.89" stroke-width="0.5"/>
+    <circle cx="15.36" cy="35.89" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="10.02" y2="28.54" stroke-width="0.5"/>
+    <circle cx="10.02" cy="28.54" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="10.02" y2="19.46" stroke-width="0.5"/>
+    <circle cx="10.02" cy="19.46" r="1.5" fill="#fff"/>
+    <line x1="24" y1="24" x2="15.36" y2="12.11" stroke-width="0.5"/>
+    <circle cx="15.36" cy="12.11" r="1.5" fill="#fff"/>
+    <line x1="24" y1="9.3" x2="32.64" y2="12.11" stroke-width="0.5"/>
+    <line x1="37.98" y1="19.46" x2="37.98" y2="28.54" stroke-width="0.5"/>
+    <line x1="32.64" y1="35.89" x2="24" y2="38.7" stroke-width="0.5"/>
+    <line x1="15.36" y1="35.89" x2="10.02" y2="28.54" stroke-width="0.5"/>
+    <line x1="10.02" y1="19.46" x2="15.36" y2="12.11" stroke-width="0.5"/>
+  </g>
+</svg>
