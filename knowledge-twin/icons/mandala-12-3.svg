@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <g fill="none" stroke="#fff" stroke-width="1">
+    <circle cx="24" cy="24" r="7.67"/>
+    <circle cx="24" cy="16.33" r="1.53"/>
+    <circle cx="27.83" cy="17.36" r="1.53"/>
+    <circle cx="30.64" cy="20.17" r="1.53"/>
+    <circle cx="31.67" cy="24" r="1.53"/>
+    <circle cx="30.64" cy="27.83" r="1.53"/>
+    <circle cx="27.83" cy="30.64" r="1.53"/>
+    <circle cx="24" cy="31.67" r="1.53"/>
+    <circle cx="20.17" cy="30.64" r="1.53"/>
+    <circle cx="17.36" cy="27.83" r="1.53"/>
+    <circle cx="16.33" cy="24" r="1.53"/>
+    <circle cx="17.36" cy="20.17" r="1.53"/>
+    <circle cx="20.17" cy="17.36" r="1.53"/>
+    <circle cx="24" cy="24" r="15.33"/>
+    <circle cx="24" cy="8.67" r="3.07"/>
+    <circle cx="31.67" cy="10.72" r="3.07"/>
+    <circle cx="37.28" cy="16.33" r="3.07"/>
+    <circle cx="39.33" cy="24" r="3.07"/>
+    <circle cx="37.28" cy="31.67" r="3.07"/>
+    <circle cx="31.67" cy="37.28" r="3.07"/>
+    <circle cx="24" cy="39.33" r="3.07"/>
+    <circle cx="16.33" cy="37.28" r="3.07"/>
+    <circle cx="10.72" cy="31.67" r="3.07"/>
+    <circle cx="8.67" cy="24" r="3.07"/>
+    <circle cx="10.72" cy="16.33" r="3.07"/>
+    <circle cx="16.33" cy="10.72" r="3.07"/>
+    <circle cx="24" cy="24" r="23"/>
+    <circle cx="24" cy="1" r="4.6"/>
+    <circle cx="35.5" cy="4.08" r="4.6"/>
+    <circle cx="43.92" cy="12.5" r="4.6"/>
+    <circle cx="47" cy="24" r="4.6"/>
+    <circle cx="43.92" cy="35.5" r="4.6"/>
+    <circle cx="35.5" cy="43.92" r="4.6"/>
+    <circle cx="24" cy="47" r="4.6"/>
+    <circle cx="12.5" cy="43.92" r="4.6"/>
+    <circle cx="4.08" cy="35.5" r="4.6"/>
+    <circle cx="1" cy="24" r="4.6"/>
+    <circle cx="4.08" cy="12.5" r="4.6"/>
+    <circle cx="12.5" cy="4.08" r="4.6"/>
+    <line x1="24" y1="16.33" x2="24" y2="1" stroke-width="0.5"/>
+    <line x1="27.83" y1="17.36" x2="35.5" y2="4.08" stroke-width="0.5"/>
+    <line x1="30.64" y1="20.17" x2="43.92" y2="12.5" stroke-width="0.5"/>
+    <line x1="31.67" y1="24" x2="47" y2="24" stroke-width="0.5"/>
+    <line x1="30.64" y1="27.83" x2="43.92" y2="35.5" stroke-width="0.5"/>
+    <line x1="27.83" y1="30.64" x2="35.5" y2="43.92" stroke-width="0.5"/>
+    <line x1="24" y1="31.67" x2="24" y2="47" stroke-width="0.5"/>
+    <line x1="20.17" y1="30.64" x2="12.5" y2="43.92" stroke-width="0.5"/>
+    <line x1="17.36" y1="27.83" x2="4.08" y2="35.5" stroke-width="0.5"/>
+    <line x1="16.33" y1="24" x2="1" y2="24" stroke-width="0.5"/>
+    <line x1="17.36" y1="20.17" x2="4.08" y2="12.5" stroke-width="0.5"/>
+    <line x1="20.17" y1="17.36" x2="12.5" y2="4.08" stroke-width="0.5"/>
+    <circle cx="24" cy="24" r="2" fill="#fff"/>
+  </g>
+</svg>
