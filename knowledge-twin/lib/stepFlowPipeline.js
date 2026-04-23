@@ -811,7 +811,23 @@ async function activateFlowRuntime(flowId, { log = console.log, maxRetries = 3, 
 // normal harnessCode output — `template` is the logic.js code, everything
 // else is step.json fields. stepInputData defaults are pre-populated so
 // the deployed harness step runs without any per-scenario POST overrides.
+//
+// Template id: we explicitly reuse the canonical harness template id that
+// was deployed once to the Step Building Space (flow
+// 302c2289-4f87-4ceb-8d79-2a14378281c0, template
+// 34d9445a-5629-43ba-919e-5a231021d4e4) so every spawned harness shares
+// the same id. Benefits:
+//   - Version-pinning: each harness deploy records which harness template
+//     version ran its tests, so "did my flow's tests change because the
+//     flow changed or because the harness changed?" is answerable.
+//   - Dedup on canvas: the Step Builder UI's template picker groups by
+//     id; a common id means all harnesses show up as instances of the
+//     same template in the library.
+//   - Splice-step optimization: when an id is present, splice-step can
+//     skip template re-creation and just wire the new instance — faster.
 // ---------------------------------------------------------------------------
+const CANONICAL_HARNESS_TEMPLATE_ID = '34d9445a-5629-43ba-919e-5a231021d4e4';
+
 function buildHarnessedHarnessTemplate(ctx) {
   const meta = ctx.harnessMeta || {};
   const scenarios = meta.scenarios || [];
@@ -858,7 +874,9 @@ function buildHarnessedHarnessTemplate(ctx) {
   const version = stepJson.version || '1.0.0';
 
   return {
-    id: null, // splice will either match existing by label or assign new
+    // Reuse the canonical deployed harness template id so every harness
+    // shares the same lineage. See comment above for rationale.
+    id: CANONICAL_HARNESS_TEMPLATE_ID,
     name,
     label,
     version,

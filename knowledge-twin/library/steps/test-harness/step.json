@@ -111,6 +111,11 @@
         ],
         "elapsedMs": 2890
       }
-    ]
-  }
+    ],
+    "targetFlowUrl": "https://em.edison.api.onereach.ai/http/<account>/<path>",
+    "harnessVersion": "1.0.0",
+    "code": "HARNESS_ERROR",
+    "message": "Only present on __error__ exit — indicates the harness itself failed to run"
+  },
+  "help": "# Test Harness (Flow Tester)\n\nA trust-anchored test runner for any deployed Edison flow. Provide a target URL and a scenario suite; the harness posts each scenario's input, polls for completion, diffs the actual response against the expected criteria, and returns an aggregate verdict.\n\n## Inputs\n\n- **targetFlowUrl** (required) — full HTTPS URL to post scenarios to\n- **scenarios** (required) — JSON array of `{ name, input, expect }` objects\n- **timeoutMs, pollDelayMs, maxPolls** — tunables for per-scenario budgets\n- **failFast** — stop on first failure (for CI gates) vs run all (for forensic runs)\n\n## Scenario `expect` shapes\n\nAny combination of these assertions is valid:\n- `{ code: \"X\" }` — exact code match\n- `{ codeOneOf: [\"A\", \"B\"] }` — one of these codes\n- `{ codeOneOfOrSuccess: [\"X\"] }` — either one of these or no code (success)\n- `{ messageIncludes: \"substring\" }` — message contains substring\n- `{ shape: { field: \"string\"|\"number\"|\"boolean\"|\"array\"|\"object\" } }` — type check\n- `{ includes: [\"needle1\", \"needle2\"] }` — response JSON contains substrings\n- `{ diffNonEmpty: true }` — target's `diff[]` field has entries (for rewrite steps)\n- `{ rewrittenDiffers: true }` — target's `rewrittenText` differs from input source text\n\n## Output\n\n- `verdict`: `pass` | `fail`\n- `summary`: `{ total, passed, failed, skipped, durationMs }`\n- `results[]`: per-scenario detail with `diff` array on failure\n\n## Exits\n\n- `next` — all scenarios passed\n- `failures` — at least one scenario failed (structured diffs in results[])\n- `__error__` — harness infrastructure broken (bad URL, invalid scenarios)\n- `__timeout__` — overall step timeout\n\n## Provenance\n\nThis template is hand-built and NOT pipeline-generated. It is validated via `test/harnessGolden.test.js` against a set of known-correct and known-broken target fixtures. Every test harness deployed by `--spawn-harness` splices its scenarios into a fresh instance of this template.\n"
 }

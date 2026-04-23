@@ -231,8 +231,8 @@ class TestHarness extends Step {
       return this.exitStep('__error__', { code: 'MISSING_INPUT', message: 'scenarios array is empty' });
     }
 
-    const timeoutMs = Number(this.data.timeoutMs) || 30_000;
-    const pollDelayMs = Number(this.data.pollDelayMs) || 2_500;
+    const timeoutMs = Number(this.data.timeoutMs) || 30000;
+    const pollDelayMs = Number(this.data.pollDelayMs) || 2500;
     const maxPolls = Number(this.data.maxPolls) || 20;
     const failFast = this.data.failFast === true || this.data.failFast === 'true';
 
