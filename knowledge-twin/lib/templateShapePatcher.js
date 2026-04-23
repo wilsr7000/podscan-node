@@ -146,31 +146,31 @@ TEMPLATE_PATCHERS.push({
   },
 });
 
-// Defect: ERROR_EXIT_NOT_ENABLED — template has an __error__ exit but
-// data.processError is missing or false.
+// Defect: ERROR_EXIT_UI_FLAG_MISMATCH — exits[] contains __error__ but
+// data.processError is missing or false. UI-consistency only; runtime does
+// not read processError (flow-sdk resolves __error__ purely by exits[]
+// membership via getExitStepId — data.ts:94-104). Fix aligns step.json with
+// step-builder-UI's convention so Studio doesn't strip the exit on save.
 TEMPLATE_PATCHERS.push({
-  id: 'ERROR_EXIT_NOT_ENABLED',
-  severity: 'error',
-  description: 'Template has __error__ exit declared but processError is not enabled. Flip processError:true.',
+  id: 'ERROR_EXIT_UI_FLAG_MISMATCH',
+  severity: 'warning',
+  description: 'Template has __error__ exit in exits[] but processError is not true. Flip processError:true to match Studio convention (runtime already works via exits[] alone).',
   match(jsonContents) {
     let spec;
     try { spec = JSON.parse(jsonContents); } catch { return null; }
     const exits = Array.isArray(spec.exits) ? spec.exits : [];
     const hasErrorExit = exits.some((e) => e && (e.id === '__error__' || e.id === 'error'));
     if (!hasErrorExit) return null;
-    if (spec.processTimeout === true) {
-      // No concerns — processError might be handled elsewhere
-    }
-    if (spec.processError === true) return null;  // already enabled
+    if (spec.processError === true) return null;  // already aligned
     // Two cases: property exists as false/absent → flip it; property absent → add it
     if (/"processError"\s*:\s*(false|null)/.test(jsonContents)) {
       return {
         edits: [{
           oldText: jsonContents.match(/"processError"\s*:\s*(false|null)/)[0],
           newText: '"processError": true',
-          rationale: 'Enabled processError to match declared __error__ exit.',
+          rationale: 'Enabled processError to match declared __error__ exit (Studio-alignment).',
         }],
-        rationale: 'Flipped processError:false → true.',
+        rationale: 'Flipped processError:false → true for Studio-UI consistency.',
       };
     }
     // Not present — insert near exits/dataOut
@@ -181,9 +181,9 @@ TEMPLATE_PATCHERS.push({
           edits: [{
             oldText: m[0],
             newText: `${m[0]},\n  "processError": true`,
-            rationale: 'Added processError:true so __error__ exit is usable at runtime.',
+            rationale: 'Added processError:true to match Studio-UI convention (runtime already routes to __error__ via exits[] membership).',
           }],
-          rationale: 'Inserted processError:true.',
+          rationale: 'Inserted processError:true for Studio-alignment.',
         };
       }
     }
@@ -191,11 +191,12 @@ TEMPLATE_PATCHERS.push({
   },
 });
 
-// Defect: TIMEOUT_EXIT_NOT_ENABLED — same pattern for __timeout__.
+// Defect: TIMEOUT_EXIT_UI_FLAG_MISMATCH — same UI-consistency pattern for
+// __timeout__ / processTimeout.
 TEMPLATE_PATCHERS.push({
-  id: 'TIMEOUT_EXIT_NOT_ENABLED',
-  severity: 'error',
-  description: 'Template has __timeout__ exit but processTimeout is not enabled. Flip processTimeout:true.',
+  id: 'TIMEOUT_EXIT_UI_FLAG_MISMATCH',
+  severity: 'warning',
+  description: 'Template has __timeout__ exit in exits[] but processTimeout is not true. Flip processTimeout:true to match Studio convention.',
   match(jsonContents) {
     let spec;
     try { spec = JSON.parse(jsonContents); } catch { return null; }
@@ -208,9 +209,9 @@ TEMPLATE_PATCHERS.push({
         edits: [{
           oldText: jsonContents.match(/"processTimeout"\s*:\s*(false|null)/)[0],
           newText: '"processTimeout": true',
-          rationale: 'Enabled processTimeout to match declared __timeout__ exit.',
+          rationale: 'Enabled processTimeout to match declared __timeout__ exit (Studio-alignment).',
         }],
-        rationale: 'Flipped processTimeout:false → true.',
+        rationale: 'Flipped processTimeout:false → true for Studio-UI consistency.',
       };
     }
     if (/"exits"\s*:/.test(jsonContents)) {
@@ -220,13 +221,130 @@ TEMPLATE_PATCHERS.push({
           edits: [{
             oldText: m[0],
             newText: `${m[0]},\n  "processTimeout": true`,
-            rationale: 'Added processTimeout:true so __timeout__ exit is usable.',
+            rationale: 'Added processTimeout:true for Studio-UI consistency.',
           }],
-          rationale: 'Inserted processTimeout:true.',
+          rationale: 'Inserted processTimeout:true for Studio-alignment.',
         };
       }
     }
     return null;
+  },
+});
+
+// Defect: ERROR_EXIT_NOT_DECLARED — the real runtime bug. Step code calls
+// this.exitStep('__error__', …) but data.exits[] has no entry with that id.
+// The SDK resolves exits purely by exits[] dict lookup (flow-sdk/src/step/
+// data.ts:94-104); without the entry, getExitStepId returns undefined and
+// error routing silently breaks.
+//
+// Fix: append { id: '__error__', label: 'error', condition: 'processError' }
+// to exits[] AND set processError:true (the Studio-convention pair). Needs a
+// {code, jsonContents} context — match() gets only jsonContents, so we rely
+// on the step.json declaring other error-plumbing signals (label hinting
+// "error" exit, dataOut naming, etc.) to infer the need. A cleaner version
+// would accept code in context; see findTemplateShapePatches(ctx).
+TEMPLATE_PATCHERS.push({
+  id: 'ERROR_EXIT_NOT_DECLARED',
+  severity: 'error',
+  description: 'Step code references __error__ but exits[] has no matching entry. Append the canonical exit entry so the runtime can route errors.',
+  match(jsonContents, ctx = {}) {
+    let spec;
+    try { spec = JSON.parse(jsonContents); } catch { return null; }
+    const exits = Array.isArray(spec.exits) ? spec.exits : [];
+    const hasErrorExit = exits.some((e) => e && (e.id === '__error__' || e.id === 'error'));
+    if (hasErrorExit) return null;
+    // Need a code signal to confirm the patcher is warranted — either the
+    // validator flagged ERROR_EXIT_NOT_DECLARED (via ctx), or the caller
+    // passed ctx.code containing exitStep('__error__', …).
+    const codeHint = ctx && typeof ctx.code === 'string' ? ctx.code : '';
+    const validatorHint = ctx && Array.isArray(ctx.validatorFindings)
+      ? ctx.validatorFindings.some((f) => f && f.code === 'ERROR_EXIT_NOT_DECLARED')
+      : false;
+    const callsErrorExit = /this\.exitStep\s*\(\s*['"`](?:error|__error__)['"`]/.test(codeHint);
+    if (!callsErrorExit && !validatorHint) return null;
+
+    // Append exit entry + processError:true pair. Match an empty or non-empty
+    // exits[] array; preserve trailing comma/whitespace.
+    const exitsRe = /"exits"\s*:\s*\[([\s\S]*?)\]/;
+    const m = exitsRe.exec(jsonContents);
+    if (!m) return null;
+    const existing = m[1].trim();
+    const entry = '{ "id": "__error__", "label": "error", "condition": "processError" }';
+    const newExits = existing
+      ? `"exits": [${m[1].replace(/\s*$/, '')}${existing.endsWith(',') ? '' : ','}\n    ${entry}\n  ]`
+      : `"exits": [\n    ${entry}\n  ]`;
+    const edits = [{
+      oldText: m[0],
+      newText: newExits,
+      rationale: 'Appended { id: "__error__", label: "error", condition: "processError" } to exits[] — the runtime invariant per §4.2.',
+    }];
+    // Also set processError:true if not present or false.
+    if (spec.processError !== true) {
+      if (/"processError"\s*:\s*(false|null)/.test(jsonContents)) {
+        edits.push({
+          oldText: jsonContents.match(/"processError"\s*:\s*(false|null)/)[0],
+          newText: '"processError": true',
+          rationale: 'Set processError:true alongside the new __error__ exit (Studio-convention pair).',
+        });
+      } else if (!/"processError"\s*:/.test(jsonContents)) {
+        edits.push({
+          oldText: newExits,
+          newText: `${newExits},\n  "processError": true`,
+          rationale: 'Added processError:true alongside the new __error__ exit (Studio-convention pair).',
+        });
+      }
+    }
+    return { edits, rationale: 'Declared __error__ exit in exits[] (the real runtime gate) and aligned Studio flag.' };
+  },
+});
+
+// Defect: TIMEOUT_EXIT_NOT_DECLARED — same runtime gap for __timeout__.
+TEMPLATE_PATCHERS.push({
+  id: 'TIMEOUT_EXIT_NOT_DECLARED',
+  severity: 'error',
+  description: 'Step code references __timeout__ but exits[] has no matching entry. Append the canonical exit entry so the runtime can route timeouts.',
+  match(jsonContents, ctx = {}) {
+    let spec;
+    try { spec = JSON.parse(jsonContents); } catch { return null; }
+    const exits = Array.isArray(spec.exits) ? spec.exits : [];
+    const hasTimeoutExit = exits.some((e) => e && (e.id === '__timeout__' || e.id === 'timeout'));
+    if (hasTimeoutExit) return null;
+    const codeHint = ctx && typeof ctx.code === 'string' ? ctx.code : '';
+    const validatorHint = ctx && Array.isArray(ctx.validatorFindings)
+      ? ctx.validatorFindings.some((f) => f && f.code === 'TIMEOUT_EXIT_NOT_DECLARED')
+      : false;
+    const callsTimeoutExit = /this\.exitStep\s*\(\s*['"`](?:timeout|__timeout__)['"`]/.test(codeHint);
+    if (!callsTimeoutExit && !validatorHint) return null;
+
+    const exitsRe = /"exits"\s*:\s*\[([\s\S]*?)\]/;
+    const m = exitsRe.exec(jsonContents);
+    if (!m) return null;
+    const existing = m[1].trim();
+    const entry = '{ "id": "__timeout__", "label": "timeout", "condition": "processTimeout" }';
+    const newExits = existing
+      ? `"exits": [${m[1].replace(/\s*$/, '')}${existing.endsWith(',') ? '' : ','}\n    ${entry}\n  ]`
+      : `"exits": [\n    ${entry}\n  ]`;
+    const edits = [{
+      oldText: m[0],
+      newText: newExits,
+      rationale: 'Appended { id: "__timeout__", label: "timeout", condition: "processTimeout" } to exits[] — the runtime invariant per §4.3.',
+    }];
+    if (spec.processTimeout !== true) {
+      if (/"processTimeout"\s*:\s*(false|null)/.test(jsonContents)) {
+        edits.push({
+          oldText: jsonContents.match(/"processTimeout"\s*:\s*(false|null)/)[0],
+          newText: '"processTimeout": true',
+          rationale: 'Set processTimeout:true alongside the new __timeout__ exit (Studio-convention pair).',
+        });
+      } else if (!/"processTimeout"\s*:/.test(jsonContents)) {
+        edits.push({
+          oldText: newExits,
+          newText: `${newExits},\n  "processTimeout": true`,
+          rationale: 'Added processTimeout:true alongside the new __timeout__ exit (Studio-convention pair).',
+        });
+      }
+    }
+    return { edits, rationale: 'Declared __timeout__ exit in exits[] (the real runtime gate) and aligned Studio flag.' };
   },
 });
 

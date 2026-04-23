@@ -1801,6 +1801,73 @@ if (!apiKey) return this.exitStep('__error__', { code: 'AUTH_RETRIEVAL_FAILED', 
       }
 
       if (blockers.length > 0) {
+        // Before giving up to the outer retry (which does full-file regen via
+        // the remote generate-step-code flow — the "LLM creates new bugs" loop
+        // we want to avoid), try the AGENT LOOP: Claude uses text_editor_20250728
+        // to make narrow str_replace edits guided by the specific remaining
+        // blockers. Succeeds when the validator shows 0 blockers. Falls back
+        // to the outer retry if no API key, no convergence, or explicitly
+        // disabled via AGENT_LOOP_RETRY=off.
+        const agentLoopDisabled = process.env.AGENT_LOOP_RETRY === 'off';
+        const hasKey = !!(ctx.opts?.apiKey || process.env.ANTHROPIC_API_KEY);
+        if (!agentLoopDisabled && hasKey) {
+          try {
+            const { tryAgentLoopRepair } = require('./agentLoopRepair');
+            ctx.log(`  [agent-repair] attempting surgical fixes for ${blockers.length} blocker(s)...`);
+            const agentRes = await tryAgentLoopRepair({
+              code: result.code,
+              spec: fullSpec,
+              blockers,
+              synthesizeTemplate,
+              CODE_LEVEL_BLOCKERS,
+              opts: {
+                apiKey: ctx.opts?.apiKey,
+                model: ctx.opts?.agentModel,
+                maxOuter: 3,
+                maxInner: 10,
+                log: (m) => ctx.log(`    ${m}`),
+              },
+            });
+            ctx.log(`  [agent-repair] ${agentRes.ok ? 'CONVERGED' : 'INSUFFICIENT'} — ` +
+              `outer=${agentRes.outerIterations} inner=${JSON.stringify(agentRes.innerIterationsByOuter)} ` +
+              `edits=${agentRes.applied.length} remaining=${agentRes.remainingBlockers.length} ` +
+              `ms=${agentRes.totalMs} usage=${JSON.stringify(agentRes.totalUsage || {})}`);
+            if (agentRes.ok) {
+              // Apply the agent-loop result: update in-memory code, mark source,
+              // log applied edits, and exit the verify block with success.
+              result.code = agentRes.code;
+              result.codeLength = agentRes.code.length;
+              result.source = result.source + '+agent-repaired';
+              const agentApplied = (agentRes.applied || []).map((e) => ({
+                code: 'AGENT_LOOP',
+                summary: `${e.command} ${e.path || 'logic.js'}` + (e.oldText ? ` (${e.oldText.slice(0, 40).replace(/\n/g, ' ')}...)` : ''),
+                editCount: 1,
+              }));
+              autoRepairApplied = [...(autoRepairApplied || []), ...agentApplied];
+              // Provenance for the agent loop's edits.
+              if (ctx.playbookHandle && agentApplied.length > 0) {
+                try {
+                  const { createSessionLog, persistToPlaybook } = require('./editProvenance');
+                  const sLog = createSessionLog();
+                  for (const e of agentApplied) {
+                    sLog.add({ stage: 'generateCode', file: 'in-memory:result.code', defectId: e.code, source: 'llm', rationale: e.summary });
+                  }
+                  persistToPlaybook(ctx.playbookHandle, sLog.all()).catch(() => {});
+                } catch { /* ignore */ }
+              }
+              blockers = [];  // cleared — skip the "return ok:false" branch below
+            }
+          } catch (err) {
+            ctx.log(`  [agent-repair] error: ${err.message} — falling back to outer retry`);
+          }
+        } else if (!hasKey) {
+          ctx.log('  [agent-repair] skipped (no ANTHROPIC_API_KEY) — falling back to full-file retry');
+        } else if (agentLoopDisabled) {
+          ctx.log('  [agent-repair] disabled via AGENT_LOOP_RETRY=off');
+        }
+      }
+
+      if (blockers.length > 0) {
         const reason = `${blockers.length} code-level validator blocker(s): ` +
           blockers.map(b => `[${b.code}] ${String(b.message || '').slice(0, 80)}`).join('; ');
         return {

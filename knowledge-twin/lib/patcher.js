@@ -76,12 +76,24 @@ PATCHERS.push({
   },
 });
 
-// Defect: UNCONDITIONAL_ERROR_EXIT — call exitStep('__error__') without checking this.data.processError.
-// The runtime rejects __error__ with "Invalid exit" when processError:false.
+// Defect: UNCONDITIONAL_ERROR_EXIT — call exitStep('__error__') without
+// checking this.data.processError.
+//
+// NOTE (§4.2 correction): this patcher predates the runtime-truth clarification.
+// The SDK does NOT reject __error__ when processError:false — flow-sdk
+// resolves exits purely by exits[] dict lookup (data.ts:94-104) and never
+// reads processError. The real runtime bug is "__error__ not in exits[]",
+// handled by ERROR_EXIT_NOT_DECLARED in templateShapePatcher.
+//
+// This patcher now serves a narrower purpose: Studio-alignment. Gating the
+// error exit behind this.data.processError keeps logic.js consistent with
+// step.json when the UI-toggle is off (so a flow author who disables "Process
+// errors" in Studio doesn't see the code keep trying to use the hidden exit).
+// It's defense-in-depth, not a runtime fix.
 PATCHERS.push({
   id: 'UNCONDITIONAL_ERROR_EXIT',
-  severity: 'error',
-  description: 'exitStep("__error__", ...) called unconditionally. Wrap in `if (this.data.processError) return this.exitStep("__error__", ...); throw new Error(...)` or the step dies with "Invalid exit \'__error__\'" when processError:false.',
+  severity: 'warning',
+  description: 'exitStep("__error__", ...) called unconditionally. Wrap in if (this.data.processError) for Studio-toggle alignment. Not a runtime gate — the SDK resolves __error__ by exits[] membership regardless of processError.',
   match(contents) {
     // Match lines like `return this.exitStep('__error__', {...})` not preceded by processError check.
     const edits = [];
@@ -101,10 +113,10 @@ PATCHERS.push({
       const errCode = codeMatch ? codeMatch[1] : 'STEP_FAILED';
       const errMsg = msgMatch ? msgMatch[1] : 'step failed';
       const newText = `${indent}if (this.data.processError) return this.exitStep('__error__', ${errObj});\n${indent}throw Object.assign(new Error(${JSON.stringify(errMsg)}), { code: ${JSON.stringify(errCode)} });`;
-      edits.push({ oldText, newText, rationale: 'Gate __error__ exit behind processError; throw when disabled.' });
+      edits.push({ oldText, newText, rationale: 'Gate __error__ exit behind processError for Studio-toggle alignment (not a runtime gate — see §4.2).' });
     }
     if (edits.length === 0) return null;
-    return { edits, rationale: `Gated ${edits.length} unconditional exitStep("__error__") call(s).` };
+    return { edits, rationale: `Gated ${edits.length} unconditional exitStep("__error__") call(s) for Studio-alignment.` };
   },
 });
 

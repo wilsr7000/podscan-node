@@ -257,7 +257,17 @@ try {
 return this.exitStep('__error__', { ... });   // getExitStepId returns undefined → thread falls through
 ```
 
-**Why**: If the exit is missing from `exits[]`, `exitStep('__error__', …)` never routes and the thrown/caught error may silently drop. Guarding with `if (this.data.processError)` keeps logic.js in sync with the UI flag when step.json was generated from the builder. **Validator**: `ERROR_EXIT_NOT_ENABLED` (exit missing from list), `ERROR_EXIT_CALLED_BUT_DISABLED` (code exits to `__error__` without guard or exit entry). **Patcher**: `UNCONDITIONAL_ERROR_EXIT` + `ERROR_EXIT_NOT_ENABLED` (template-shape).
+**Why**: The SDK resolves `__error__` purely by `exits[]` dict lookup (`flow-sdk/src/step/data.ts:94-104`). `data.processError` is **never read** by the runtime — zero matches across flow-sdk source. Missing the exit from `exits[]` is the only runtime-breaking failure; `processError` is UI-alignment only. Guarding `exitStep('__error__')` behind `if (this.data.processError)` keeps logic.js consistent with the Studio toggle but is not required for correctness.
+
+**Validators**:
+- `ERROR_EXIT_NOT_DECLARED` (**error**): code calls `exitStep('__error__')` but `exits[]` has no entry with that id — the real runtime bug.
+- `ERROR_EXIT_UI_FLAG_MISMATCH` (**warning**): `exits[]` has `__error__` but `processError !== true` — Studio-alignment only; runtime routes correctly regardless.
+- `EXIT_NOT_DEFINED` (**warning**): generic equivalent — code exits to any id not in `exits[]`.
+
+**Patchers**:
+- `ERROR_EXIT_NOT_DECLARED` (template-shape, real fix): appends the canonical exit entry and pairs it with `processError: true`.
+- `ERROR_EXIT_UI_FLAG_MISMATCH` (template-shape, alignment-only): flips `processError: true` so logic.js and Studio agree.
+- `UNCONDITIONAL_ERROR_EXIT` (code-level, alignment-only, downgraded to **warning**): wraps `exitStep('__error__')` in `if (this.data.processError)`. Keeps code consistent when a flow author toggles "Process errors" off in Studio. Not a runtime gate.
 
 ### Rule 4.3 — `__timeout__` exit must appear in `data.exits[]` and have a timeout source
 
@@ -276,7 +286,14 @@ Runtime check: `currentStep?.getExitStepId('__timeout__')` (`flow-sdk/src/thread
 }
 ```
 
-**Validator**: `TIMEOUT_EXIT_NOT_ENABLED` (exit missing) or `TIMEOUT_EXIT_NO_DURATION` (flag on but no trigger source). **Patcher**: `TIMEOUT_EXIT_NOT_ENABLED`.
+**Validators**:
+- `TIMEOUT_EXIT_NOT_DECLARED` (**error**): code calls `exitStep('__timeout__')` but `exits[]` has no matching entry — the real runtime bug.
+- `TIMEOUT_EXIT_UI_FLAG_MISMATCH` (**warning**): `exits[]` has `__timeout__` but `processTimeout !== true` — Studio-alignment only.
+- `TIMEOUT_EXIT_NO_DURATION` (**error**): `processTimeout: true` with the exit declared but no `timeoutDuration` set and no `this.triggers.timeout(...)` call — the exit exists but can never fire.
+
+**Patchers**:
+- `TIMEOUT_EXIT_NOT_DECLARED` (template-shape, real fix): appends the canonical exit entry and pairs it with `processTimeout: true`.
+- `TIMEOUT_EXIT_UI_FLAG_MISMATCH` (template-shape, alignment-only): flips `processTimeout: true`.
 
 ### Rule 4.4 — Exit payload: success has data, error has `{code, message}`
 
@@ -1017,7 +1034,55 @@ const cleaned = String(value).replace(/^`|`$/g, '').trim();
 - `this.triggers.on(eventName, cb)` / `.once` / `.off` / `.local` / `.otherwise` / `.hook` — subscribe for channel or broadcast events.
 - `this.triggers.hasTimeout()` / `.refreshTimeout(ms)` / `.refreshAll()` — inspect / manage.
 
-`this.waits` is a read-only map of currently-registered triggers on this step.
+`this.waits` (`flow-sdk/src/step.ts:151-153` proxies `flow-sdk/src/thread.ts:686-688`) is a `Record<string | symbol, ITrigger>` of currently-registered triggers on this thread's current state. Keys are event names; the `TIMEOUT` symbol key holds the step timeout with `params.timeoutTime` in epoch-ms (`flow-sdk/src/thread.ts:314`, also `this.thread.nextTimeout`). Entries are written **inline** as each `this.triggers.on/once/local/hook/off/timeout/deadline` call executes (`flow-sdk/src/services/triggers.ts:145,151,159`), so within `runStep` you can introspect everything installed so far in the current pass. Each value is an `ITrigger` — `{ name?, params?, target?, thread?, type?, timeoutTime?, ... }` (`flow-sdk/src/types/triggers.ts:18-47`). The auto-installed `data.timeoutDuration` timeout is added later by `Step.runHandle` (`flow-sdk/src/step.ts:198-210`), after `runStep` returns, so it will NOT be in `this.waits` during `runStep`.
+
+```javascript
+async runStep(event) {
+  this.triggers.timeout(5000, () => this.exitStep('__timeout__', {}));
+  this.triggers.on('user.reply', (ev) => this.exitStep('next', ev.params));
+
+  // count non-timeout subscriptions already installed this pass
+  const keys = Object.keys(this.waits);  // string keys only; TIMEOUT symbol is hidden
+  if (keys.length < 2 && !this.data.replyOnly) {
+    this.triggers.on('user.cancel', () => this.exitStep('cancelled', {}));
+  }
+}
+```
+
+Treat `this.waits` as read-only — mutate via `this.triggers.*`, not by assigning keys directly.
+
+**`this.event`** is the triggering event envelope. `Step.event` is a getter for `this.thread.event` (`flow-sdk/src/step.ts:111-117`); the runtime writes it when it dispatches an `ACTION.event` action (`flow-sdk/src/thread.ts:1673`). When a trigger fires, the handler is called as `handler.call(currentStep, event)` (`flow-sdk/src/services/triggers.ts:354`) — the event is passed as the argument AND `this.event` refers to the same object. Shape (`flow-sdk/src/types/event.ts:17-44`):
+
+```javascript
+interface IEvent<P, N> {
+  name: N;                    // event name — guaranteed
+  params: P;                  // payload — guaranteed
+  id?: string;
+  processed?: boolean | StepId;
+  source?: AccountId;
+  target?: AccountId;
+  thread?: ThreadHandler;
+  threads?: ThreadHandler[];
+  timeout?: true;             // set when event is a timeout firing
+  broadcast?: boolean;
+  session?: SessionData;
+  // ...
+}
+```
+
+Only `name` and `params` are guaranteed. `this.event` is NOT `this.data` — `this.data` is the resolved merge-field snapshot for the step (§3.1); `this.event` is the wakeup envelope.
+
+```javascript
+async runStep(event) {
+  return this.triggers.on('user.reply', (ev) => {
+    // ev === this.event; prefer the argument in handlers
+    const text = ev.params?.message;
+    return this.exitStep('next', { text });
+  });
+}
+```
+
+Prefer the event argument over `this.event` inside trigger handlers — the argument is the contract; `this.event` is an alias that happens to be set at dispatch time.
 
 ### 15.7 — Thread hooks (`this.on` / `once` / `off`)
 
@@ -1284,10 +1349,11 @@ The following validator rule IDs (from `lib/stepValidator.js`) map to platform-r
 | SECRET_IN_CODE | 12.4 | error |
 | ASYNC_NO_AWAIT | — | warning |
 | EXITSTEP_NO_RETURN | 4.1 | error |
-| EXIT_NOT_DEFINED | 4.5 | error |
-| ERROR_EXIT_CALLED_BUT_DISABLED | 4.2 | error |
-| ERROR_EXIT_NOT_ENABLED | 4.2 | error |
-| TIMEOUT_EXIT_NOT_ENABLED | 4.3 | error |
+| EXIT_NOT_DEFINED | 4.5 | warning |
+| ERROR_EXIT_NOT_DECLARED | 4.2 | error |
+| ERROR_EXIT_UI_FLAG_MISMATCH | 4.2 | warning |
+| TIMEOUT_EXIT_NOT_DECLARED | 4.3 | error |
+| TIMEOUT_EXIT_UI_FLAG_MISMATCH | 4.3 | warning |
 | AUTH_NO_KV_RESOLUTION | 11.1 | error |
 | AUTH_PLAIN_TEXT_INPUT | 11.1 | error |
 | FORM_INPUT_NO_MERGE_FIELDS | 5.2 | error |
@@ -1328,13 +1394,15 @@ Active patchers (see `lib/patcher.js` + `lib/templateShapePatcher.js`):
 | Patcher ID | Fixes | Section |
 |---|---|---|
 | AUTH_RESOLVE_STRIPS_TOKEN_SUFFIX | ::token:: strip in `_resolveApiKey` | 11.2 |
-| UNCONDITIONAL_ERROR_EXIT | Unguarded `exitStep('__error__')` | 4.2 |
+| UNCONDITIONAL_ERROR_EXIT | Wrap `exitStep('__error__')` in `if (this.data.processError)` — Studio-alignment only, not a runtime gate | 4.2 |
 | EQEQ | Loose equality → strict | validator-only |
 | HARDCODED_URL | URL literal → this.data input | 3.2 |
 | AUTH_NO_KV_RESOLUTION | Missing or-sdk/storage block | 11.1 |
 | TEMPLATE_NO_ICON | Missing iconUrl + iconType:"custom" | — |
-| ERROR_EXIT_NOT_ENABLED | Flip `processError: true` | 4.2 |
-| TIMEOUT_EXIT_NOT_ENABLED | Flip `processTimeout: true` | 4.3 |
+| ERROR_EXIT_NOT_DECLARED | Append `{id:'__error__', …}` to `exits[]` + set `processError:true` (real runtime fix) | 4.2 |
+| ERROR_EXIT_UI_FLAG_MISMATCH | Flip `processError: true` — Studio-alignment only | 4.2 |
+| TIMEOUT_EXIT_NOT_DECLARED | Append `{id:'__timeout__', …}` to `exits[]` + set `processTimeout:true` (real runtime fix) | 4.3 |
+| TIMEOUT_EXIT_UI_FLAG_MISMATCH | Flip `processTimeout: true` — Studio-alignment only | 4.3 |
 | TEMPLATE_DESCRIPTION_TOO_LONG | Truncate description | 7.2 |
 | TEMPLATE_HELP_DUPLICATES_DESCRIPTION | Insert structured skeleton | 7.1 |
 
