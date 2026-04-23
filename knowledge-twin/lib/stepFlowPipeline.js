@@ -29,6 +29,7 @@ const STAGES = [
   'designUI',
   'userVerify',
   'testWithUI',
+  'spawnTestHarness',  // Phase 5: extract OpenAPI, generate test playbook, optionally deploy sibling harness
   'done',
 ];
 
@@ -3269,6 +3270,201 @@ async function stageTestWithUI(ctx) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// stageSpawnTestHarness (Phase 5) — auto-spawn a test harness for the
+// freshly-built target flow.
+//
+// What it does:
+//   1. Extracts an OpenAPI 3.0 spec from the deployed template (Phase 2)
+//   2. Generates a test playbook markdown (Phase 3; LLM when key available)
+//   3. Writes both as artifacts in the job dir: fr-openapi.json + test-playbook.md
+//   4. If opts.spawnHarness === true: invokes runPipeline recursively with the
+//      generated playbook. Phase 4 detects the harness playbook and routes
+//      through the short-circuit path (no generateCode, no harnessCode),
+//      producing a sibling harness flow.
+//   5. Records the harness flow URL back onto the parent's playbook KV
+//      metadata so WISER / UI can surface "run tests for this flow".
+//
+// Safety:
+//   - SKIPPED if ctx.harnessMode === true (don't spawn a harness for a
+//     harness — recursion guard, even though Phase 4 would handle it).
+//   - SKIPPED if ctx.flowId / ctx.deployedTemplate / ctx.httpPath is missing
+//     (no target to test).
+//   - Non-fatal: any failure logs loudly but does not break the parent
+//     pipeline. The target flow is already deployed; harness spawn is
+//     complementary.
+//   - Opt-in: controlled by opts.spawnHarness. Default: write artifacts
+//     only, don't run the recursive pipeline. Flip to on once we're
+//     confident the recursive spawn is stable.
+// ---------------------------------------------------------------------------
+async function stageSpawnTestHarness(ctx) {
+  const s = startStage('spawnTestHarness');
+
+  // Guard: never spawn a harness FOR a harness.
+  if (ctx.harnessMode === true) {
+    ctx.log('  [spawn-harness] skipping — this IS a harness run; no sibling to spawn');
+    return endStage(s, { skipped: true, reason: 'self-is-harness' });
+  }
+
+  // Guard: need a deployed target with a reachable endpoint.
+  const deployedTemplate = ctx.deployedTemplate || ctx.harnessResult?.template;
+  const gatewayPath = ctx.httpPath || ctx.validationResult?.httpPath;
+  if (!deployedTemplate || !ctx.flowId) {
+    ctx.log('  [spawn-harness] skipping — no deployed template or flowId on ctx');
+    return endStage(s, { skipped: true, reason: 'no deployed target' });
+  }
+  if (!gatewayPath) {
+    ctx.log('  [spawn-harness] skipping — no gatewayPath on ctx (validate stage did not report httpPath)');
+    return endStage(s, { skipped: true, reason: 'no gateway path' });
+  }
+
+  // Build the artifacts regardless of whether we'll actually spawn the
+  // harness — the OpenAPI + playbook are useful docs either way.
+  let openApiDoc, playbookArtifact;
+  try {
+    const { buildOpenApi } = require('./flowOpenApiExtractor');
+    openApiDoc = buildOpenApi({
+      template: deployedTemplate,
+      gatewayPath,
+      flowId: ctx.flowId,
+      accountId: process.env.ONEREACH_ACCOUNT_ID || undefined,
+    });
+  } catch (err) {
+    ctx.log(`  [spawn-harness] OpenAPI extraction failed (continuing): ${err.message}`);
+    return endStage(s, { skipped: true, reason: 'openapi-extract-failed', error: err.message });
+  }
+
+  const fullFlowUrl = `${BASE_URL}/${gatewayPath.replace(/^\//, '')}`;
+  const target = {
+    flowId: ctx.flowId,
+    flowUrl: fullFlowUrl,
+    label: deployedTemplate.label || ctx.objective?.label || 'Flow',
+    name: deployedTemplate.name || 'flow',
+  };
+
+  try {
+    const { generateTestPlaybook } = require('./testPlaybookGenerator');
+    playbookArtifact = await generateTestPlaybook({
+      sourcePlaybook: ctx.playbook || ctx.bestPlan || '',
+      openApi: openApiDoc,
+      target,
+      opts: {
+        apiKey: ctx.opts?.apiKey,
+        // llmMode: default 'auto' — use LLM if key is present, fall back
+        // to deterministic otherwise. The pipeline is opinionated: richer
+        // scenarios are strictly better for the test layer.
+        llmMode: ctx.opts?.harnessLlmMode || 'auto',
+        log: (m) => ctx.log('  ' + m),
+      },
+    });
+  } catch (err) {
+    ctx.log(`  [spawn-harness] playbook generation failed (continuing): ${err.message}`);
+    return endStage(s, { skipped: true, reason: 'playbook-gen-failed', error: err.message });
+  }
+
+  // Persist both artifacts in the job dir so they're inspectable even if
+  // the recursive spawn is disabled.
+  try {
+    const dir = jobDir(ctx.jobId);
+    const openApiPath = path.join(dir, 'target-openapi.json');
+    const playbookPath = path.join(dir, 'harness-playbook.md');
+    fs.writeFileSync(openApiPath, JSON.stringify(openApiDoc, null, 2));
+    fs.writeFileSync(playbookPath, playbookArtifact.markdown);
+    ctx.log(`  [spawn-harness] artifacts: ${path.relative(process.cwd(), openApiPath)}, ${path.relative(process.cwd(), playbookPath)}`);
+    ctx.log(`  [spawn-harness] scenarios: ${playbookArtifact.scenarios.length} (${playbookArtifact.deterministicCount} deterministic + ${playbookArtifact.llmCount} LLM-augmented)`);
+  } catch (err) {
+    ctx.log(`  [spawn-harness] artifact write failed (continuing): ${err.message}`);
+  }
+
+  // If opts.spawnHarness is off, we stop here — artifacts are on disk for
+  // the user to inspect, and the `--spawn-harness` flag is the next step
+  // if they want auto-deploy.
+  const shouldSpawn = ctx.opts?.spawnHarness === true || ctx.opts?.spawnHarness === 'true';
+  if (!shouldSpawn) {
+    ctx.log('  [spawn-harness] artifacts written; recursive spawn skipped (pass --spawn-harness to deploy)');
+    return endStage(s, {
+      skipped: false,
+      spawned: false,
+      scenarioCount: playbookArtifact.scenarios.length,
+      artifactsOnly: true,
+    });
+  }
+
+  // Recursive pipeline run — produces a SIBLING harness flow that targets
+  // the just-built flow. Phase 4's harness-mode detection fires inside
+  // runPipeline, short-circuiting generateCode/harnessCode/localScenarioRun.
+  //
+  // Uses a fresh jobId so the child run has its own .pipeline-jobs/ dir;
+  // state isolated from the parent.
+  ctx.log('  [spawn-harness] starting recursive pipeline run for harness deploy...');
+  let childResult;
+  try {
+    const os = require('os');
+    const tmpPlaybookPath = path.join(os.tmpdir(), `harness-playbook-${ctx.jobId}-${Date.now()}.md`);
+    fs.writeFileSync(tmpPlaybookPath, playbookArtifact.markdown);
+
+    const childOpts = {
+      playbookPath: tmpPlaybookPath,
+      apiKey: ctx.opts?.apiKey,
+      botId: ctx.opts?.botId,
+      flowUrl: ctx.opts?.flowUrl,
+      log: (m) => ctx.log('    [child] ' + m),
+      // Never recurse: the child IS a harness, so ctx.harnessMode will
+      // be set by stagePlaybook's detection. Phase 4's guard in
+      // stageSpawnTestHarness also prevents this. Belt-and-suspenders:
+      // explicitly disable spawnHarness on the child.
+      spawnHarness: false,
+    };
+
+    childResult = await runPipeline(childOpts);
+    // Clean up the tmp playbook file — it's captured in the child job dir.
+    try { fs.unlinkSync(tmpPlaybookPath); } catch {}
+  } catch (err) {
+    ctx.log(`  [spawn-harness] recursive pipeline THREW (continuing): ${err.message}`);
+    return endStage(s, {
+      skipped: false,
+      spawned: false,
+      error: err.message,
+      artifactsOnly: true,
+    });
+  }
+
+  const childStages = (childResult?.completedStages || []).map((x) => x.name).join(' → ');
+  const childFlowId = childResult?.ctx?.flowId || childResult?.flowId;
+  ctx.log(`  [spawn-harness] child pipeline completed: stages=[${childStages}] harness flowId=${childFlowId || '(unknown)'}`);
+
+  // Record the harness flow URL on the parent's playbook KV entry. This
+  // lets downstream consumers (WISER, dashboards) surface "View tests for
+  // this flow" without re-running the extractor.
+  if (ctx.playbookHandle && childFlowId) {
+    try {
+      const playbookStore = require('./playbookStore');
+      const harnessStudioUrl = `${STUDIO_BASE}/${childFlowId}`;
+      const harnessRecord = {
+        harnessFlowId: childFlowId,
+        harnessStudioUrl,
+        scenarioCount: playbookArtifact.scenarios.length,
+        createdAt: new Date().toISOString(),
+      };
+      await playbookStore.updateStage(ctx.playbookHandle, 'spawnTestHarness', {
+        status: 'done',
+        data: harnessRecord,
+      });
+      ctx.log(`  [spawn-harness] recorded harness flow on parent playbook: ${harnessStudioUrl}`);
+    } catch (err) {
+      ctx.log(`  [spawn-harness] failed to record harness on parent playbook (continuing): ${err.message}`);
+    }
+  }
+
+  return endStage(s, {
+    skipped: false,
+    spawned: true,
+    scenarioCount: playbookArtifact.scenarios.length,
+    childFlowId,
+    childStages,
+  });
+}
+
 async function stageDone(ctx) {
   const s = startStage('done');
 
@@ -3312,6 +3508,7 @@ const STAGE_FNS = {
   designUI: stageDesignUI,
   userVerify: stageUserVerify,
   testWithUI: stageTestWithUI,
+  spawnTestHarness: stageSpawnTestHarness,
   done: stageDone,
 };
 
@@ -4067,4 +4264,6 @@ module.exports = {
   _stageGenerateCode: stageGenerateCode,
   _stageHarnessCode: stageHarnessCode,
   _buildHarnessedHarnessTemplate: buildHarnessedHarnessTemplate,
+  // Phase 5: exposed for integration tests of the post-build wire-in.
+  _stageSpawnTestHarness: stageSpawnTestHarness,
 };

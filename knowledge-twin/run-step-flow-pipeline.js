@@ -36,6 +36,8 @@ function parseArgs(argv) {
     if (arg === '--bot-id' && args[i + 1])        { opts.botId = args[++i]; continue; }
     if (arg === '--flow-url' && args[i + 1])      { opts.flowUrl = args[++i]; continue; }
     if (arg === '--inject-probe' && args[i + 1])  { opts.injectProbe = args[++i]; continue; }
+    if (arg === '--spawn-harness') { opts.spawnHarness = true; continue; }
+    if (arg === '--harness-llm-mode' && args[i + 1]) { opts.harnessLlmMode = args[++i]; continue; }
     if (arg === '--monitor') { opts.monitor = true; continue; }
     if (arg === '--help' || arg === '-h') {
       printHelp();
