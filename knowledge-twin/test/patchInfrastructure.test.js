@@ -260,6 +260,93 @@ module.exports = X;
     assertEq(r.code, code, 'original returned unchanged on failure');
   });
 
+  console.log('\n== fix 2.1: HARDCODED_URL ignores URLs inside comments ==');
+
+  await test('URL inside // comment is NOT replaced', () => {
+    const code = `class X {
+  // Migration note: the old impl was "https://legacy.example.com/v1" before the refactor.
+  async runStep() {
+    const url = this.data.apiUrl + '/current';
+    return this.exitStep('next', { url });
+  }
+}
+module.exports = X;
+`;
+    const spec = { inputs: [{ variable: 'apiUrl', type: 'text', default: 'https://api.example.com' }] };
+    const { patchable } = findPatches(code, { spec });
+    const entry = patchable.find((p) => p.id === 'HARDCODED_URL');
+    assert(!entry, 'should NOT match URL inside a line comment');
+  });
+
+  await test('URL inside /* */ block comment is NOT replaced', () => {
+    const code = `class X {
+  /* Example usage: fetch("https://example.com/v1") */
+  async runStep() {
+    return this.exitStep('next', {});
+  }
+}
+`;
+    const spec = { inputs: [{ variable: 'apiUrl', type: 'text', default: 'https://example.com' }] };
+    const { patchable } = findPatches(code, { spec });
+    const entry = patchable.find((p) => p.id === 'HARDCODED_URL');
+    assert(!entry, 'should NOT match URL inside a block comment');
+  });
+
+  await test('URL inside a genuine string literal IS still replaced', () => {
+    const code = `class X {
+  async runStep() {
+    const r = await fetch("https://api.weatherapi.com/v1/current");
+    return this.exitStep('next', { r });
+  }
+}
+`;
+    const spec = { inputs: [{ variable: 'apiBaseUrl', type: 'text', default: 'https://api.weatherapi.com/v1' }] };
+    const { patchable } = findPatches(code, { spec });
+    const entry = patchable.find((p) => p.id === 'HARDCODED_URL');
+    assert(entry, 'should match URL that is a real string literal');
+  });
+
+  console.log('\n== fix 2.3: AUTH_NO_KV_RESOLUTION parameterizes collection from spec ==');
+
+  await test('AUTH_NO_KV_RESOLUTION uses spec auth input collection when present', () => {
+    const code = `class X {
+  async runStep() {
+    const key = this.data.auth;
+    await fetch('/x', { headers: { authorization: key } });
+    return this.exitStep('next', {});
+  }
+}
+`;
+    const spec = {
+      inputs: [
+        { variable: 'auth', type: 'auth', config: { collection: '__authorization_service_Anthropic' } },
+      ],
+    };
+    const { patchable } = findPatches(code, { spec });
+    const entry = patchable.find((p) => p.id === 'AUTH_NO_KV_RESOLUTION');
+    assert(entry, 'should match AUTH_NO_KV_RESOLUTION');
+    const newText = entry.edits[0].newText;
+    assert(newText.includes('__authorization_service_Anthropic'),
+      'injected block should reference spec collection, got: ' + newText.slice(0, 300));
+    assert(!newText.includes('__authorization_service_Default'),
+      'injected block should NOT fall back to Default when spec provides collection');
+  });
+
+  await test('AUTH_NO_KV_RESOLUTION falls back to Default when spec has no auth input', () => {
+    const code = `class X {
+  async runStep() {
+    const key = this.data.auth;
+    return this.exitStep('next', { key });
+  }
+}
+`;
+    const { patchable } = findPatches(code, { spec: { inputs: [] } });
+    const entry = patchable.find((p) => p.id === 'AUTH_NO_KV_RESOLUTION');
+    assert(entry);
+    assert(entry.edits[0].newText.includes('__authorization_service_Default'),
+      'should default to Default when spec has no auth input');
+  });
+
   console.log('\n== budget + proposeLLMEdits integration ==');
 
   await test('proposeLLMEdits respects budget, stops at max LLM attempts', async () => {

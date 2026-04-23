@@ -232,16 +232,23 @@ PATCHERS.push({
     const spec = ctx && ctx.spec;
     if (!spec || !Array.isArray(spec.inputs)) return null;
 
+    // Before scanning for URL literals, BLANK OUT comments so URLs inside
+    // `// ...` and `/* ... */` don't get falsely matched. Keep string
+    // contents intact — a URL that is its own string literal IS a
+    // legitimate runtime target. The blank-fill preserves byte positions,
+    // so downstream regex replacement on `contents` still lines up.
+    const codeOnly = stripCommentsOnly(contents);
+
     // Find URL literals not already inside a this.data expression or template interpolation.
     const urlSet = new Set();
     const urlRe = /(['"`])(https?:\/\/[^'"`\s]+)\1/g;
     let m;
-    while ((m = urlRe.exec(contents)) !== null) {
+    while ((m = urlRe.exec(codeOnly)) !== null) {
       const url = m[2];
       // Skip if same line references this.data (already resolved)
-      const lineStart = contents.lastIndexOf('\n', m.index) + 1;
-      const lineEnd = contents.indexOf('\n', m.index);
-      const line = contents.slice(lineStart, lineEnd > 0 ? lineEnd : contents.length);
+      const lineStart = codeOnly.lastIndexOf('\n', m.index) + 1;
+      const lineEnd = codeOnly.indexOf('\n', m.index);
+      const line = codeOnly.slice(lineStart, lineEnd > 0 ? lineEnd : codeOnly.length);
       if (/this\.data/.test(line)) continue;
       // Skip common exempt patterns
       if (/api\.anthropic\.com|github\.com|localhost/.test(url)) continue;
@@ -336,7 +343,7 @@ PATCHERS.push({
   id: 'AUTH_NO_KV_RESOLUTION',
   severity: 'error',
   description: 'Code reads this.data.auth credential but doesn\'t resolve it via or-sdk/storage. Inject canonical storage.get block.',
-  match(contents) {
+  match(contents, ctx) {
     const hasAuthRead = /this\.data\.auth\b/.test(contents);
     // Resolution counts as present if:
     //   (a) full canonical pattern: require('or-sdk/storage') + .get(   OR
@@ -361,9 +368,34 @@ PATCHERS.push({
     const m = contents.match(runStepRe);
     if (!m) return null;
 
+    // Parameterize the auth collection from the spec (2.3 fix): prefer the
+    // spec's declared auth-external-component collection over the hardcoded
+    // `__authorization_service_Default`. Without this, a step with an
+    // Anthropic/Google/etc auth input gets the wrong collection injected →
+    // storage.get misses at runtime → silent auth failure.
+    const spec = ctx && ctx.spec;
+    let specCollection = '__authorization_service_Default';
+    let collectionReason = 'default (spec had no auth input with config.collection)';
+    if (spec && Array.isArray(spec.inputs)) {
+      const authInputs = spec.inputs.filter((i) => {
+        if (i && (i.type === 'auth' || i.component === 'auth-external-component')) return true;
+        const coll = i?.config?.collection || i?.data?.keyValueCollection || i?.keyValueCollection;
+        return typeof coll === 'string' && /^__authorization_service_/.test(coll);
+      });
+      const collections = authInputs.map((i) => i?.config?.collection || i?.data?.keyValueCollection || i?.keyValueCollection).filter(Boolean);
+      if (collections.length === 1) {
+        specCollection = collections[0];
+        collectionReason = `from spec auth input "${authInputs[0].variable || ''}"`;
+      } else if (collections.length > 1) {
+        // Multiple auth inputs — pick the first, but log the ambiguity.
+        specCollection = collections[0];
+        collectionReason = `from first of ${collections.length} spec auth inputs (ambiguous)`;
+      }
+    }
+
     const oldOpen = m[0];
     const canonical = `
-      // [patcher: canonical auth resolution — fixes AUTH_NO_KV_RESOLUTION]
+      // [patcher: canonical auth resolution — fixes AUTH_NO_KV_RESOLUTION, collection ${collectionReason}]
       let _authInput = this.data.auth;
       if (typeof _authInput === 'object' && _authInput !== null) {
         _authInput = _authInput.auth || _authInput.authSelected || '';
@@ -373,7 +405,7 @@ PATCHERS.push({
       }
       const _authCollection = (this.data.authCollection && this.data.authCollection !== 'undefined')
         ? this.data.authCollection
-        : '__authorization_service_Default';
+        : ${JSON.stringify(specCollection)};
       const _Storage = require('or-sdk/storage');
       const _storage = new _Storage(this);
       const _creds = await _storage.get(_authCollection, _authInput).catch(() => null);
@@ -387,9 +419,9 @@ PATCHERS.push({
       edits: [{
         oldText: oldOpen,
         newText: `${oldOpen}${canonical}\n`,
-        rationale: 'Injected canonical storage.get() auth resolution block at top of runStep.',
+        rationale: `Injected canonical storage.get() auth block with collection="${specCollection}" (${collectionReason}).`,
       }],
-      rationale: 'Added canonical or-sdk/storage auth resolution.',
+      rationale: `Added canonical or-sdk/storage auth resolution for collection "${specCollection}".`,
     };
   },
 });
@@ -450,6 +482,48 @@ function stripStringsAndComments(s) {
     }
     out += c;
     i++;
+  }
+  return out;
+}
+
+// stripCommentsOnly — blank out `//` and `/* */` comment CONTENT but keep
+// everything else (including string literals) intact. Used by HARDCODED_URL
+// so URLs inside comments aren't falsely matched, while URLs that are
+// genuine string literals (the ones we DO want to replace) remain visible.
+// Byte positions are preserved — each comment char becomes a space (newlines
+// preserved) so downstream replacements on the original string still align.
+function stripCommentsOnly(s) {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    // Line comment
+    if (c === '/' && s[i + 1] === '/') {
+      while (i < s.length && s[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+    // Block comment
+    if (c === '/' && s[i + 1] === '*') {
+      out += '  '; i += 2;
+      while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) {
+        out += s[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      out += '  '; i += 2;
+      continue;
+    }
+    // String literal — preserve content (URLs in strings are valid targets)
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      out += c; i++;
+      while (i < s.length && s[i] !== quote) {
+        if (s[i] === '\\' && i + 1 < s.length) { out += s[i] + s[i + 1]; i += 2; continue; }
+        out += s[i]; i++;
+      }
+      if (i < s.length) { out += s[i]; i++; }
+      continue;
+    }
+    out += c; i++;
   }
   return out;
 }

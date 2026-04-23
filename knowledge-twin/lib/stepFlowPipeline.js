@@ -23,6 +23,7 @@ const STAGES = [
   'conceive',
   'generateCode',
   'harnessCode',
+  'localScenarioRun',  // run scenarios locally (in-process) BEFORE splice — catches code bugs 30-90s earlier (fix 2.2b)
   'validate',
   'testStep',    // run scenario-based tests against the deployed step endpoint
   'designUI',
@@ -2073,6 +2074,289 @@ async function stageHarnessCode(ctx) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// stageLocalScenarioRun — run the same scenario suite stageTestStep runs, but
+// execute each scenario against an in-process mock Edison runtime instead of a
+// deployed HTTP endpoint. Runs BEFORE splice/activate, so a code defect that
+// would have failed the deployed scenario catches ~30-90s earlier and triggers
+// outer-retry regeneration without paying the splice tax.
+//
+// Why this is the biggest reliability win:
+//   • Splice + activate is 30-90s; subprocess scenario run is 200-500ms.
+//   • Every "generator wrote wrong exit id / didn't read this.data.foo / threw
+//     TypeError on empty array" bug gets caught here.
+//   • Failures populate ctx.testResults with shape identical to stageTestStep,
+//     so the existing outer retry loop picks them up and regenerates.
+//
+// Graceful degradation:
+//   • No harnessed template → skip.
+//   • No scenarios available (playbook or spec-derivable) → skip.
+//   • Step imports an SDK we haven't mocked (module load failed) → skip THAT
+//     scenario (label 'local-skipped'), don't fail the stage. The deployed
+//     testStep will cover it.
+//   • Step calls gateway-only APIs (triggers.on, thread.fork) → local runtime
+//     throws "not supported"; skip the scenario.
+//
+// Failure cases (trigger outer retry):
+//   • Step runs but returns wrong exit id / wrong code / missing required field.
+//   • Step throws a hard runtime error (TypeError, ReferenceError) from code
+//     bugs the validator didn't catch.
+// ---------------------------------------------------------------------------
+async function stageLocalScenarioRun(ctx) {
+  const s = startStage('localScenarioRun');
+
+  const harnessed = ctx.harnessedTemplate;
+  if (!harnessed || !harnessed.template) {
+    ctx.log('  [local-scenarios] no harnessed template — skip');
+    return endStage(s, { skipped: true, reason: 'no harnessed template' });
+  }
+
+  // Extract className. The final template is
+  //   class FooGSX extends Step { ... }
+  // possibly wrapped in an IIFE. Match the first occurrence.
+  const classMatch = /class\s+(\w+)\s+extends\s+Step\b/.exec(harnessed.template);
+  if (!classMatch) {
+    ctx.log('  [local-scenarios] no "class X extends Step" in template — skip');
+    return endStage(s, { skipped: true, reason: 'no class extends Step' });
+  }
+  const className = classMatch[1];
+
+  // Gather scenarios. Identical prioritization to stageTestStep so local +
+  // remote runs operate on the SAME scenario set — if something passes local,
+  // it should have a fighting chance at passing remote.
+  const { parseScenariosFromPlaybook, deriveScenariosFromSpec, _diagnose } = require('./stepScenarios');
+
+  let scenarios = null;
+  let source = null;
+  if (typeof ctx.bestPlan === 'string' && ctx.bestPlan.length > 0) {
+    scenarios = parseScenariosFromPlaybook(ctx.bestPlan);
+    if (scenarios && scenarios.length > 0) source = 'playbook';
+  }
+
+  // Derive from harnessed template's formBuilder when no playbook scenarios —
+  // same path stageTestStep uses (line 2444-2491). The template's formBuilder
+  // is the most accurate spec post-harness because buildStepTemplate rebuilds
+  // it from the actual this.data reads in code.
+  let spec = null;
+  if (!scenarios || scenarios.length === 0) {
+    const tplInputs = harnessed.formBuilder?.stepInputs || [];
+    if (tplInputs.length > 0) {
+      const COMPONENT_TO_TYPE = {
+        formTextInput: 'text', formTextBox: 'text', formTextArea: 'textarea', formTextarea: 'textarea',
+        formNumber: 'number', formNumberInput: 'number', formSwitch: 'boolean', formCheckbox: 'boolean',
+        formSelectExpression: 'select', formSelect: 'select', formRadio: 'select',
+        formDate: 'date', formCode: 'code', formJson: 'json',
+        'auth-external-component': 'auth',
+      };
+      const convertedInputs = tplInputs.map((inp) => {
+        const comp = Array.isArray(inp.component) ? inp.component[0] : (inp.component || '');
+        const d = inp.data || {};
+        const type = COMPONENT_TO_TYPE[comp] || 'text';
+        let options;
+        if (Array.isArray(d.options)) {
+          options = d.options.map((o) => (typeof o === 'object' ? { value: o.value, label: o.label } : { value: o, label: o }));
+        }
+        return {
+          variable: d.variable,
+          label: d.label || d.variable,
+          type,
+          required: d.validateRequired === true,
+          default: d.defaultValue,
+          example: d.example,
+          helpText: d.helpText || '',
+          options,
+          config: type === 'auth' ? { collection: d.keyValueCollection || d.collection } : undefined,
+        };
+      }).filter((i) => i.variable);
+      spec = {
+        name: harnessed.name || 'step',
+        label: harnessed.label || 'Step',
+        description: harnessed.description || '',
+        inputs: convertedInputs,
+        exits: harnessed.data?.exits || [],
+      };
+      scenarios = deriveScenariosFromSpec(spec);
+      source = 'spec-derived:template';
+    }
+  }
+
+  if (!scenarios || scenarios.length === 0) {
+    ctx.log('  [local-scenarios] no scenarios available — skip');
+    return endStage(s, { skipped: true, reason: 'no scenarios', source });
+  }
+
+  // Prepare mock storage for any auth inputs in the spec. Without this, steps
+  // that call storage.get() will return undefined → typical step code errors
+  // out with MISSING_AUTH, which is a FALSE negative (the step would work in
+  // prod with real creds). Seed with dummy creds keyed by the merge-field-
+  // encoded authId pattern the step expects.
+  const mockStorage = {};
+  const authInputs = ((spec || ctx.conceiveSpec || {}).inputs || []).filter((i) => {
+    if (!i) return false;
+    if (i.type === 'auth') return true;
+    const coll = i?.config?.collection || i?.data?.keyValueCollection || i?.keyValueCollection;
+    return typeof coll === 'string' && /^__authorization_service_/.test(coll);
+  });
+  for (const ai of authInputs) {
+    const coll = ai?.config?.collection || ai?.data?.keyValueCollection || ai?.keyValueCollection || '__authorization_service_Default';
+    if (!mockStorage[coll]) mockStorage[coll] = {};
+    // The Edison auth pattern stores creds at `service::token::<label>`. We
+    // seed with a wildcard-ish entry; if the code computes a specific authId
+    // we won't hit it, but we also don't block the run.
+    mockStorage[coll]['service::token::__stub__'] = {
+      accessToken: 'stub-access-token',
+      refreshToken: 'stub-refresh-token',
+      tokenType: 'bearer',
+      expiresAt: Date.now() + 3600_000,
+    };
+  }
+
+  // SDK mocks: stubs for the common or-sdk packages steps pull in. Any step
+  // that requires an unmocked or-sdk/* will hit "module load failed"; we
+  // detect that below and mark the scenario 'local-skipped' rather than
+  // failing.
+  const sdkMocks = {
+    'or-sdk/llm': "function(_t) { return { generate: async () => ({ text: 'stub', output: 'stub', choices: [{ text: 'stub' }], usage: { prompt_tokens: 0, completion_tokens: 0 } }) }; }",
+    'or-sdk/http': "function(_t) { return { request: async () => ({ status: 200, body: {}, headers: {} }), get: async () => ({ status: 200, body: {} }), post: async () => ({ status: 200, body: {} }) }; }",
+    'or-sdk/users': "function(_t) { return { get: async (id) => ({ id, email: 'stub@example.com', name: 'Stub User' }) }; }",
+    'or-sdk/files': "function(_t) { return { get: async () => ({ id: 'stub', content: '' }), put: async () => ({ id: 'stub' }) }; }",
+  };
+
+  const { runStepCodeLocally } = require('./localStepRuntime');
+
+  ctx.log(`  [local-scenarios] running ${scenarios.length} scenario(s) from ${source} locally against ${className}...`);
+
+  const results = [];
+  let passed = 0, failed = 0, skippedLocal = 0;
+  const skipReasons = [];
+
+  for (const sc of scenarios) {
+    const t0 = Date.now();
+    let exec;
+    try {
+      exec = await runStepCodeLocally({
+        code: harnessed.template,
+        className,
+        data: sc.input || {},
+        opts: {
+          timeoutMs: 8000,
+          mockStorage,
+          sdkMocks,
+          // Seed a config with the canonical accountId so `this.config.accountId`
+          // reads don't fail when the step logs it.
+          config: { accountId: ACCOUNT_ID, flowId: ctx.flowId, botId: BOT_ID },
+        },
+      });
+    } catch (err) {
+      exec = { ok: false, error: `harness threw: ${err.message}` };
+    }
+    const elapsedMs = Date.now() - t0;
+
+    // Detect "can't run this scenario locally" cases — NOT failures.
+    // The local runtime reports these as various error strings depending on
+    // whether the step code used require(), dynamic import(), or touched a
+    // gateway-only API.
+    const errMsg = String(exec.error || '');
+    const isUnmockable =
+      // CommonJS `require('or-sdk/*')` in the ESM child → "require is not defined"
+      /require is not defined/i.test(errMsg)
+      // Dynamic `import('or-sdk/*')` for a package we haven't stubbed
+      || /Failed to resolve module specifier/i.test(errMsg)
+      || /Cannot find module/i.test(errMsg)
+      // Package referenced via `require()`/`import()` but not in the Node.js
+      // resolution path (e.g. or-sdk/* that we haven't seeded into sdkMocks)
+      || /module load failed.*or-sdk\//i.test(errMsg)
+      // Gateway-only APIs the local runtime explicitly refuses
+      || /not supported in local runtime/i.test(errMsg)
+      || /triggers\.(on|fork|emit|waitBroadcast)/i.test(errMsg)
+      || /thread\.(fork|waitBroadcast|callExit)/i.test(errMsg);
+    if (!exec.ok && isUnmockable) {
+      skippedLocal++;
+      skipReasons.push(`"${sc.name}": ${errMsg.slice(0, 120)}`);
+      ctx.log(`    SKIP (local) "${sc.name}" — ${errMsg.slice(0, 120)}`);
+      // Still record it so the log has a row per scenario.
+      results.push({
+        name: sc.name,
+        ok: true,  // don't count as failure; remote testStep will cover it
+        phase: 'local-skipped',
+        actual: null,
+        diff: [],
+        elapsedMs,
+        skipReason: errMsg.slice(0, 200),
+      });
+      continue;
+    }
+
+    // Hard runtime failure (TypeError, ReferenceError, throw) — real bug.
+    if (!exec.ok) {
+      failed++;
+      results.push({
+        name: sc.name,
+        ok: false,
+        phase: 'local-runtime-error',
+        error: errMsg,
+        actual: null,
+        diff: [{ field: '_runtime', error: errMsg.slice(0, 300) }],
+        elapsedMs,
+      });
+      ctx.log(`    FAIL "${sc.name}" — runtime threw: ${errMsg.slice(0, 150)}`);
+      continue;
+    }
+
+    // Step ran. Build an "actual" shape matching what the deployed endpoint
+    // would return: exitPayload (usually { code, message, ... }) with exitId
+    // stashed alongside for diagnostics.
+    const actual = Object.assign({}, exec.exitPayload || {});
+    if (actual.code === undefined && exec.exitId && exec.exitId !== 'next' && exec.exitId !== 'end') {
+      // Some steps exit via __error__ / __timeout__ / custom exits without a
+      // code field in the payload — surface the exitId so _diagnose can match.
+      actual.code = actual.code || exec.exitId;
+    }
+    const diff = _diagnose(actual, sc.expect || {});
+    const ok = diff.length === 0;
+
+    const r = { name: sc.name, ok, phase: 'local-run', actual, diff, elapsedMs, exitId: exec.exitId };
+    results.push(r);
+    if (ok) {
+      passed++;
+      ctx.log(`    PASS "${sc.name}" (${elapsedMs}ms, code=${actual.code || '(none)'}, exit=${exec.exitId})`);
+    } else {
+      failed++;
+      ctx.log(`    FAIL "${sc.name}" — ${diff.length} mismatch(es):`);
+      for (const d of diff.slice(0, 3)) ctx.log(`      ${JSON.stringify(d)}`);
+    }
+  }
+
+  ctx.log(`  [local-scenarios] ${passed}/${scenarios.length} passed, ${failed} failed, ${skippedLocal} skipped (unmockable)`);
+
+  // If any scenarios failed, populate ctx.testResults so the outer retry loop
+  // regenerates WITHOUT paying the splice+deploy tax. Shape is fully
+  // compatible with stageTestStep's output (outer retry treats them the same).
+  if (failed > 0) {
+    ctx.testResults = {
+      source: 'local:' + source,
+      gatewayPath: null,
+      totalScenarios: scenarios.length,
+      passed,
+      failed,
+      skippedLocal,
+      results,
+      runAt: new Date().toISOString(),
+      preSplice: true,
+    };
+  }
+
+  return endStage(s, {
+    source,
+    totalScenarios: scenarios.length,
+    passed,
+    failed,
+    skippedLocal,
+    allPassed: failed === 0,
+    preSplice: true,
+  });
+}
+
 async function stageValidate(ctx) {
   const s = startStage('validate');
 
@@ -2812,6 +3096,7 @@ const STAGE_FNS = {
   conceive: stageConceive,
   generateCode: stageGenerateCode,
   harnessCode: stageHarnessCode,
+  localScenarioRun: stageLocalScenarioRun,
   validate: stageValidate,
   testStep: stageTestStep,
   designUI: stageDesignUI,
@@ -3377,15 +3662,31 @@ async function runPipeline(opts = {}) {
     }
 
     if (hasTestFailures) {
+      // Distinguish pre-splice (local runtime) from post-splice (deployed
+      // endpoint) so the LLM gets accurate context — "local runtime" means
+      // a deterministic subprocess caught the bug before deploy; "deployed
+      // endpoint" means the Lambda ran and responded wrong.
+      const preSplice = testResults.preSplice === true;
+      const runContext = preSplice ? 'local runtime (pre-splice)' : 'deployed endpoint';
+      const codeTag = preSplice ? 'local-scenario-failed' : 'test-scenario-failed';
+      const diagCode = preSplice ? 'LOCAL_SCENARIO_FAILED' : 'TEST_SCENARIO_FAILED';
       const failures = testResults.results.filter(r => !r.ok);
       for (const f of failures) {
         const actualCode = f.actual?.code || '(no code)';
         const shortDiff = JSON.stringify(f.diff || []).slice(0, 200);
-        reasons.push(`[test-scenario-failed] "${f.name}" — actual.code="${actualCode}", diff=${shortDiff}`);
+        reasons.push(`[${codeTag}] "${f.name}" — actual.code="${actualCode}", diff=${shortDiff}`);
+        let msg;
+        if (f.phase === 'local-runtime-error') {
+          // Subprocess threw a real error (TypeError, ReferenceError, etc.) —
+          // this is code-bug-level and trumps spec mismatch.
+          msg = `Scenario "${f.name}" threw a runtime error in ${runContext}: ${String(f.error || '').slice(0, 400)}. This is a hard code defect — the step throws before it can call this.exitStep(). Typical causes: (1) reading a nested property of undefined (e.g. this.data.foo.bar when this.data.foo is not set); (2) calling a method on null; (3) await on a non-promise; (4) ReferenceError from missing import or typo.`;
+        } else {
+          msg = `Scenario "${f.name}" failed in ${runContext}. Actual: ${JSON.stringify(f.actual).slice(0, 300)}. Diff: ${JSON.stringify(f.diff).slice(0, 200)}`;
+        }
         diagnostics.push({
-          code: 'TEST_SCENARIO_FAILED',
+          code: diagCode,
           severity: 'error',
-          message: `Scenario "${f.name}" failed at deployed endpoint. Actual: ${JSON.stringify(f.actual).slice(0, 300)}. Diff: ${JSON.stringify(f.diff).slice(0, 200)}`,
+          message: msg,
           fix: f.diff && f.diff[0] && f.diff[0].expectedOneOfOrSuccess
             ? `The step returned code="${f.actual?.code}" but the test expected either success OR one of: ${f.diff[0].expectedOneOfOrSuccess.slice(0,5).join(', ')}. This likely means code has input validation stricter than the spec declared. Check that required fields in the generated code match the spec's required fields exactly.`
             : (f.diff && f.diff[0]) ? `Diff on field "${f.diff[0].field}": expected ${JSON.stringify(f.diff[0].expected || f.diff[0].expectedOneOf || f.diff[0].expectedIncludes)}, got ${JSON.stringify(f.diff[0].actual)}.`
@@ -3519,4 +3820,6 @@ module.exports = {
   kvPut,
   kvGet,
   appendEvent,
+  // Exposed for unit tests of the pre-splice local scenario stage (fix 2.2b).
+  _stageLocalScenarioRun: stageLocalScenarioRun,
 };
