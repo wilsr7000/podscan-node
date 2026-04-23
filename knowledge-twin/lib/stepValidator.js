@@ -668,6 +668,131 @@ function lintCode(code, out) {
         { line: lineNum, text: pfMatch[0] }));
     }
   }
+
+  // -----------------------------------------------------------------------
+  // Rule 2.3 — LIFECYCLE_LOG_FORMAT
+  //
+  // Every runStep() should emit:
+  //   - one this.log.info at the top summarizing inputs received
+  //   - this.log.error in every catch block (unguarded errors → CloudWatch silence)
+  //
+  // The reusability-judge LLM pass flags "missing lifecycle logs" at the prose
+  // level; this deterministic rule catches the most common structural shapes
+  // the judge doesn't reliably notice (empty catch with just a return, or
+  // runStep opens straight into computation without a milestone log).
+  // -----------------------------------------------------------------------
+  {
+    // Find runStep(...) { ... } block. Skip if absent — steps defined via
+    // top-level functions (rare) don't exercise this rule.
+    const runStepMatch = /\b(?:async\s+)?runStep\s*\([^)]*\)\s*\{/.exec(code);
+    if (runStepMatch) {
+      const bodyStart = runStepMatch.index + runStepMatch[0].length - 1;
+      const block = extractBlock(code, bodyStart);
+      if (block) {
+        const runStepStartLine = code.slice(0, runStepMatch.index).split('\n').length;
+        // Lifecycle A: top-of-body info log. Look at the first ~10 non-blank,
+        // non-comment lines INSIDE the block for a this.log.{info,vital}
+        // call. If all early lines are destructuring/validation with no log,
+        // we warn. Allow early this.log.* at any level — a top trace/debug
+        // beats nothing.
+        const innerLines = block.split('\n').slice(1, 12);  // skip opening {
+        let topInfoFound = false;
+        for (const ln of innerLines) {
+          const t = ln.trim();
+          if (!t || t.startsWith('//') || t.startsWith('*')) continue;
+          if (/\bthis\.log\.(info|vital|warn|debug|trace|INFO|VITAL|WARN|DEBUG|TRACE)\s*[?\(]/.test(ln)) {
+            topInfoFound = true;
+            break;
+          }
+        }
+        if (!topInfoFound) {
+          out.push(diag('LIFECYCLE_LOG_FORMAT', 'warning',
+            `Line ${runStepStartLine}: runStep() has no this.log.info (or equivalent) near the top — CloudWatch will have no entry log when this step fires`,
+            'Add a this.log.info at the start of runStep() summarizing the inputs received. Per §2.3 of platform-rules.md, every step should log an entry line so forensic searches against CloudWatch can find the invocation.',
+            { line: runStepStartLine }));
+        }
+
+        // Lifecycle B: every catch block should log. Find `catch (name) { ... }`
+        // inside runStep's body and check its body has a this.log.* call.
+        // Allow `rethrow` (throw) or explicit `return this.exitStep('__error__'...)`
+        // as acceptable substitutes for a log — both surface the error.
+        const catchRe = /\bcatch\s*\(([^)]*)\)\s*\{/g;
+        let cm;
+        while ((cm = catchRe.exec(block)) !== null) {
+          const cBodyStart = cm.index + cm[0].length - 1;
+          const catchBlock = extractBlock(block, cBodyStart);
+          if (!catchBlock) continue;
+          const body = catchBlock.slice(1, -1);  // strip { }
+          const hasLog = /\bthis\.log\.(error|fatal|vital|warn|ERROR|FATAL|VITAL|WARN)\s*[?\(]/.test(body);
+          const hasRethrow = /\bthrow\b/.test(body);
+          const hasErrorExit = /exitStep\s*\(\s*['"]__error__['"]|exitStep\s*\(\s*['"]__timeout__['"]/.test(body);
+          if (!hasLog && !hasRethrow && !hasErrorExit) {
+            // Line number of the catch keyword in the original code
+            const bodyPrefixOffset = runStepMatch.index + runStepMatch[0].length - 1;
+            const absIdx = bodyPrefixOffset + cm.index;
+            const catchLine = code.slice(0, absIdx).split('\n').length;
+            out.push(diag('LIFECYCLE_LOG_FORMAT', 'warning',
+              `Line ${catchLine}: catch block has no this.log.error, no throw, and no exitStep('__error__', ...) — the error is silently swallowed`,
+              'Add this.log.error(\'<class> caught error\', { error: err.message }) OR return this.exitStep(\'__error__\', { code: \'INTERNAL_ERROR\', message: err.message }) — otherwise CloudWatch has no record of the failure.',
+              { line: catchLine }));
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DEFAULT_VALUE_MISMATCH (spec-aware) — checks that `this.data.X || '<fallback>'`
+// pattern in code matches the declared default on stepInputs[i].data.defaultValue.
+// Runs in checkFormAndData (where spec context is available).
+//
+// Why: when the spec says defaultValue is 'current' and the code silently
+// falls back to 'forecast' (or vice-versa), the step behaves differently from
+// its documented contract. Reusability-judge sometimes catches this as a prose
+// issue, but a deterministic check is faster and more reliable.
+// ---------------------------------------------------------------------------
+function checkDefaultValueMismatch(code, stepInputs, out) {
+  if (!Array.isArray(stepInputs) || stepInputs.length === 0) return;
+  const lines = code.split('\n');
+  for (const inp of stepInputs) {
+    const varName = inp?.data?.variable;
+    let declared = inp?.data?.defaultValue;
+    if (typeof varName !== 'string' || !varName) continue;
+    if (declared === undefined || declared === null) continue;
+    // Strip surrounding backticks if the default is a template-literal expression
+    if (typeof declared === 'string') {
+      declared = declared.replace(/^`|`$/g, '').trim();
+    }
+    if (declared === '') continue;
+
+    // Look for `this.data.<varName>` reads with a literal fallback:
+    //   const x = this.data.foo || 'literal';
+    //   const x = this.data.foo ?? 'literal';
+    //   this.data.foo !== 'undefined' ? this.data.foo : 'literal'
+    // Only flag when the literal is a STRING literal and it materially differs
+    // from the declared default.
+    const escapedVar = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = [
+      new RegExp(`this\\.data\\.${escapedVar}\\s*\\|\\|\\s*['"]([^'"]+)['"]`, 'g'),
+      new RegExp(`this\\.data\\.${escapedVar}\\s*\\?\\?\\s*['"]([^'"]+)['"]`, 'g'),
+      new RegExp(`this\\.data\\.${escapedVar}[^?]*\\?\\s*this\\.data\\.${escapedVar}\\s*:\\s*['"]([^'"]+)['"]`, 'g'),
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(code)) !== null) {
+        const codeFallback = m[1];
+        if (String(codeFallback) === String(declared)) continue;
+        const lineNum = code.slice(0, m.index).split('\n').length;
+        out.push(diag('DEFAULT_VALUE_MISMATCH', 'warning',
+          `Line ${lineNum}: this.data.${varName} fallback is "${codeFallback}" but the spec declares defaultValue="${declared}" — step behavior diverges from its documented contract`,
+          `Either change the code fallback to "${declared}" OR update the spec's stepInputs default to "${codeFallback}". Both should agree so flow authors get the documented behavior.`,
+          { line: lineNum, variable: varName, codeFallback, specDefault: declared }));
+        // Only flag the first occurrence per pattern per input
+        break;
+      }
+    }
+  }
 }
 
 function extractBlock(code, startIndex) {
@@ -3204,6 +3329,12 @@ const DATA_BUILTIN_KEYS = new Set([
 function checkFormAndData(step, code, out) {
   const stepInputs = step.formBuilder?.stepInputs;
   const formVars = [];
+
+  // DEFAULT_VALUE_MISMATCH — code fallback value differs from spec's declared
+  // defaultValue. Runs once per stepInputs; no-op if no spec defaults declared.
+  if (typeof code === 'string' && code.length > 0) {
+    checkDefaultValueMismatch(code, stepInputs, out);
+  }
 
   if (Array.isArray(stepInputs)) {
     // Collect variables from formBuilder inputs (skip components without a variable)

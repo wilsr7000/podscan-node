@@ -1937,10 +1937,21 @@ async function stageHarnessCode(ctx) {
         for (const d of harnessDiags.slice(0, 5)) {
           ctx.log(`    [BLK→regen] ${d.code}: ${String(d.message || '').slice(0, 100)}`);
         }
+        // Belt-and-suspenders: ctx.generatedCode is the canonical source,
+        // but if it's somehow empty (resume path where rehydration missed
+        // it), fall back to ctx.codeGenResult's code field. Without this,
+        // Generate Step Code rejects the patch with PATCH_NO_TEMPLATE.
+        const lastCode = ctx.generatedCode
+          || ctx.codeGenResult?.result?.code
+          || ctx.codeGenResult?.code
+          || '';
+        if (!lastCode) {
+          ctx.log('  [harness-retry] WARNING: no prior code available (generatedCode empty, codeGenResult missing .code) — regeneration will start fresh, not patch');
+        }
         ctx.priorDiagnosis = {
           reasons: harnessDiags.map(d => `[${d.code}] ${String(d.message || '').slice(0, 120)}`),
           diagnostics: harnessDiags,
-          lastCode: ctx.generatedCode || '',
+          lastCode,
           phase: 'harness-retry',
         };
         // Re-run generateCode — this refreshes ctx.codeGenResult, ctx.generatedCode.
@@ -2124,7 +2135,7 @@ async function stageLocalScenarioRun(ctx) {
   // Gather scenarios. Identical prioritization to stageTestStep so local +
   // remote runs operate on the SAME scenario set — if something passes local,
   // it should have a fighting chance at passing remote.
-  const { parseScenariosFromPlaybook, deriveScenariosFromSpec, _diagnose } = require('./stepScenarios');
+  const { parseScenariosFromPlaybook, deriveScenariosFromSpec, deriveScenariosAugmented, _diagnose } = require('./stepScenarios');
 
   let scenarios = null;
   let source = null;
@@ -2138,6 +2149,7 @@ async function stageLocalScenarioRun(ctx) {
   // is the most accurate spec post-harness because buildStepTemplate rebuilds
   // it from the actual this.data reads in code.
   let spec = null;
+  let llmEdgeCases = [];
   if (!scenarios || scenarios.length === 0) {
     const tplInputs = harnessed.formBuilder?.stepInputs || [];
     if (tplInputs.length > 0) {
@@ -2177,6 +2189,34 @@ async function stageLocalScenarioRun(ctx) {
       };
       scenarios = deriveScenariosFromSpec(spec);
       source = 'spec-derived:template';
+
+      // Fix D: augment with LLM-generated edge-case scenarios for richer
+      // coverage. Runs concurrently with the test loop — the deterministic
+      // set runs first (high-confidence), LLM set is appended for edge-case
+      // pressure. No-op without an API key or on any error (returns []).
+      const hasApiKeyForLLM = Boolean(ctx.opts?.apiKey || process.env.ANTHROPIC_API_KEY);
+      const llmEnabled = hasApiKeyForLLM && ctx.opts?.llmScenarios !== false;
+      if (llmEnabled) {
+        try {
+          llmEdgeCases = await deriveScenariosAugmented(spec, {
+            playbook: ctx.bestPlan || '',
+            apiKey: ctx.opts?.apiKey,
+            useLLM: true,
+            log: (m) => ctx.log('  ' + m),
+          });
+          // deriveScenariosAugmented includes the deterministic set too — dedup
+          // against our existing `scenarios` by name to get just the LLM extras.
+          const deterministicNames = new Set(scenarios.map((x) => x.name));
+          const extras = llmEdgeCases.filter((x) => !deterministicNames.has(x.name));
+          if (extras.length > 0) {
+            scenarios = [...scenarios, ...extras];
+            source = source + '+llm-edge';
+            ctx.log(`  [local-scenarios] augmented with ${extras.length} LLM edge-case scenario(s)`);
+          }
+        } catch (err) {
+          ctx.log('  [local-scenarios] LLM augmentation failed (continuing with deterministic): ' + err.message);
+        }
+      }
     }
   }
 
@@ -3184,11 +3224,40 @@ async function runPipeline(opts = {}) {
       const dir = jobDir(opts.jobId);
       const codegenPath = path.join(dir, 'codegen-result.json');
       if (fs.existsSync(codegenPath)) {
-        try { ctx.codeGenResult = JSON.parse(fs.readFileSync(codegenPath, 'utf8')); } catch {}
+        try {
+          ctx.codeGenResult = JSON.parse(fs.readFileSync(codegenPath, 'utf8'));
+          // stageGenerateCode's onPass also sets ctx.generatedCode — without
+          // that, a resume from harnessCode (or later) hits an empty
+          // priorDiagnosis.lastCode when harness detects a blocker and tries
+          // to regenerate. The Generate Step Code flow rejects such patch
+          // requests with PATCH_NO_TEMPLATE. Source it from the same saved
+          // codeGenResult so ctx is fully rehydrated.
+          const resumedCode = ctx.codeGenResult?.result?.code || ctx.codeGenResult?.code || '';
+          if (resumedCode) ctx.generatedCode = resumedCode;
+        } catch {}
       }
       const validationPath = path.join(dir, 'validation-result.json');
       if (fs.existsSync(validationPath)) {
         try { ctx.validationResult = JSON.parse(fs.readFileSync(validationPath, 'utf8')); } catch {}
+      }
+      // Restore conceive spec if present — otherwise stageGenerateCode (on
+      // retry) falls back to buildSpecFromPlaybook which often produces an
+      // empty spec from the thin plan-best.md. Conceive's spec is the actual
+      // contract generateCode was built against.
+      const conceivePath = path.join(dir, 'conceive-result.json');
+      if (fs.existsSync(conceivePath)) {
+        try {
+          const conceiveResult = JSON.parse(fs.readFileSync(conceivePath, 'utf8'));
+          ctx.conceiveSpec = conceiveResult.spec || conceiveResult.extractedSpec || conceiveResult;
+        } catch {}
+      }
+      // Some jobs saved an extractedSpec separately (the richer one from
+      // decompose's enrichment pass) — restore that too so the input-merge
+      // pass in stageGenerateCode can widen fullSpec as it would in a
+      // single-shot run.
+      const specPath = path.join(dir, 'extracted-spec.json');
+      if (fs.existsSync(specPath)) {
+        try { ctx.extractedSpec = JSON.parse(fs.readFileSync(specPath, 'utf8')); } catch {}
       }
       ctx.log(`  Resumed job: ${opts.jobId} (from ${source})`);
       ctx.log(`  Flow ID:     ${ctx.flowId || '(none)'}`);
