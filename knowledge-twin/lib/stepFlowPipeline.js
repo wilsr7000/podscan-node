@@ -803,6 +803,90 @@ async function activateFlowRuntime(flowId, { log = console.log, maxRetries = 3, 
 }
 
 // ---------------------------------------------------------------------------
+// Harness-mode: construct a spliceable template from the library-local
+// Phase 1 Test Harness source + the playbook's scenarios + target URL.
+//
+// The returned template mirrors the shape stageValidate expects from a
+// normal harnessCode output — `template` is the logic.js code, everything
+// else is step.json fields. stepInputData defaults are pre-populated so
+// the deployed harness step runs without any per-scenario POST overrides.
+// ---------------------------------------------------------------------------
+function buildHarnessedHarnessTemplate(ctx) {
+  const meta = ctx.harnessMeta || {};
+  const scenarios = meta.scenarios || [];
+  const targetFlowUrl = meta.targetFlowUrl || '';
+
+  // Load the canonical harness artifacts from library/steps/test-harness/.
+  // These are shipped as source-of-truth; every harness instance references
+  // the same logic.
+  const harnessDir = path.join(__dirname, '..', 'library', 'steps', 'test-harness');
+  const stepJsonPath = path.join(harnessDir, 'step.json');
+  const logicPath = path.join(harnessDir, 'logic.js');
+  if (!fs.existsSync(stepJsonPath) || !fs.existsSync(logicPath)) {
+    throw new Error(`Harness library files not found under ${harnessDir}`);
+  }
+  const stepJson = JSON.parse(fs.readFileSync(stepJsonPath, 'utf8'));
+  const logic = fs.readFileSync(logicPath, 'utf8');
+
+  // Pre-configure the stepInputData with this harness's scenarios + target.
+  // Each stepInputs entry gets a defaultValue; the deployed step reads
+  // this.data.<var> which picks up these defaults when the POST body is empty.
+  const stepInputs = (stepJson.inputs || []).map((inp) => {
+    let defaultValue = inp.default;
+    if (inp.variable === 'targetFlowUrl') defaultValue = '`' + targetFlowUrl + '`';
+    else if (inp.variable === 'scenarios') defaultValue = '`' + JSON.stringify(scenarios).replace(/`/g, '\\`') + '`';
+    // other inputs keep their declared defaults (timeoutMs, pollDelayMs, etc.)
+    const component = inp.type === 'json' ? 'formJson'
+      : inp.type === 'number' ? 'formNumberInput'
+      : inp.type === 'boolean' ? 'formSwitch'
+      : 'formTextInput';
+    return {
+      component,
+      data: {
+        variable: inp.variable,
+        label: inp.label || inp.variable,
+        helpText: inp.helpText || '',
+        defaultValue: defaultValue !== undefined ? defaultValue : '``',
+        validateRequired: inp.required === true,
+      },
+    };
+  });
+
+  const label = `${meta.targetLabel || 'Flow'} Test Harness`;
+  const name = `test_harness_${(meta.targetName || 'flow').toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+  const version = stepJson.version || '1.0.0';
+
+  return {
+    id: null, // splice will either match existing by label or assign new
+    name,
+    label,
+    version,
+    description: `Test harness targeting ${meta.targetLabel || 'flow'} (${meta.testHarnessFor || 'unknown'}). Scenarios pre-configured; POST with empty body to run.`,
+    template: logic,                       // the code
+    kind: 'logic',
+    icon: stepJson.icon || 'check-square',
+    shape: stepJson.shape || 'circle',
+    size: stepJson.size || 'small',
+    service: stepJson.service || 'Pipeline',
+    categories: stepJson.categories || ['Testing'],
+    modules: stepJson.modules || [],
+    form: {},
+    formBuilder: { stepInputs },
+    data: stepJson.data || {
+      exits: [{ id: 'next' }, { id: 'failures' }, { id: '__error__', condition: 'processError' }],
+    },
+    outputExample: stepJson.outputExample,
+    // Provenance for debugging + stageValidate audit.
+    _harnessMode: {
+      builtFrom: 'library/steps/test-harness/',
+      targetFlowId: meta.testHarnessFor,
+      targetFlowUrl,
+      scenarioCount: scenarios.length,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Playbook → full spec for code generation
 // ---------------------------------------------------------------------------
 
@@ -964,9 +1048,35 @@ async function stagePlaybook(ctx) {
   ctx.playbook = markdown;
   ctx.log(`  Loaded from ${source} (${markdown.length} chars, sections: ${sectionNumbers.join(', ')})`);
 
+  // ── Phase 4: detect test-harness playbooks and tag ctx.harnessMode ──
+  // If detected, downstream generateCode / harnessCode / localScenarioRun
+  // take short-circuit paths that splice the hand-built Test Harness
+  // template instead of generating fresh step code. See
+  // lib/harnessPlaybookDetector.js for the detection contract.
+  try {
+    const { isTestHarnessPlaybook, parseTestHarnessMeta, validateHarnessMeta } = require('./harnessPlaybookDetector');
+    if (isTestHarnessPlaybook(markdown)) {
+      const meta = parseTestHarnessMeta(markdown);
+      const check = validateHarnessMeta(meta);
+      if (!check.ok) {
+        ctx.log(`  [harness-mode] detected test-harness playbook but metadata is incomplete (missing: ${check.missing.join(', ')}) — falling back to normal pipeline`);
+      } else {
+        const { parseScenariosFromPlaybook } = require('./stepScenarios');
+        const scenarios = parseScenariosFromPlaybook(markdown) || [];
+        ctx.harnessMode = true;
+        ctx.harnessMeta = { ...meta, scenarios };
+        ctx.log(`  [harness-mode] detected — target=${meta.targetLabel} (${meta.testHarnessFor}), ${scenarios.length} scenario(s) pre-configured`);
+      }
+    }
+  } catch (err) {
+    ctx.log(`  [harness-mode] detection threw (continuing in normal mode): ${err.message}`);
+  }
+
   return endStage(s, {
     source, chars: markdown.length, sections: sectionNumbers,
     path: playbookPath || null,
+    harnessMode: ctx.harnessMode === true,
+    harnessMeta: ctx.harnessMode ? { testHarnessFor: ctx.harnessMeta.testHarnessFor, scenarioCount: ctx.harnessMeta.scenarios.length } : null,
   });
 }
 
@@ -1342,6 +1452,20 @@ let _autoRepairKnownBlockersRef = null;
 // Retry: 3×. Each retry escalates context — prior failures become
 // priorDiagnosis which the stage forwards as patchInstructions.
 async function stageGenerateCode(ctx) {
+  // ── Harness-mode short-circuit (Phase 4) ──────────────────────────────
+  // When the pipeline is running a test-harness playbook we DON'T generate
+  // new step code. The hand-built Test Harness (Phase 1) is the one-and-
+  // only runner; we just splice it with the scenarios from the playbook.
+  // Mark the stage completed with a synthetic codeGenResult so downstream
+  // code that reads ctx.generatedCode / ctx.codeGenResult doesn't null-
+  // deref.
+  if (ctx.harnessMode === true) {
+    ctx.log('  [harness-mode] skipping generateCode — hand-built Test Harness is reused');
+    ctx.codeGenResult = { source: 'harness-template', code: '', skipped: true };
+    ctx.generatedCode = '';
+    return { name: 'generateCode', startMs: Date.now(), data: { skipped: true, reason: 'harness-mode' } };
+  }
+
   const alive = await checkEndpointAlive('generateCode', ctx.log);
   if (!alive) {
     throw new Error('Generate Step Code flow is inactive. Activate it first.');
@@ -1923,6 +2047,27 @@ if (!apiKey) return this.exitStep('__error__', { code: 'AUTH_RETRIEVAL_FAILED', 
 }
 
 async function stageHarnessCode(ctx) {
+  // ── Harness-mode short-circuit (Phase 4) ──────────────────────────────
+  // In harness mode we don't build a fresh template — we take the hand-
+  // built Test Harness library step, set its stepInputData defaults to
+  // the scenarios + target URL from the harness playbook, and hand that
+  // to stageValidate for splicing. No code generation, no logging pass,
+  // no validator loop — the harness template has already been validated
+  // by the Phase 1 golden-set suite.
+  if (ctx.harnessMode === true) {
+    const s = startStage('harnessCode');
+    try {
+      const harnessed = buildHarnessedHarnessTemplate(ctx);
+      ctx.harnessResult = { template: harnessed, diagnostics: [], valid: true, fixes: [], version: harnessed.version };
+      ctx.harnessedTemplate = harnessed;
+      ctx.log(`  [harness-mode] built harness template instance with ${(ctx.harnessMeta?.scenarios || []).length} scenario(s) pre-configured`);
+      return endStage(s, { skipped: false, harnessMode: true, scenarioCount: (ctx.harnessMeta?.scenarios || []).length });
+    } catch (err) {
+      ctx.log(`  [harness-mode] failed to build harness template: ${err.message}`);
+      throw err;
+    }
+  }
+
   // Harness is a pure transform on (code, spec). If the wrapped template has
   // code-level validator blockers, the right fix is to regenerate the code —
   // re-wrapping the same broken code will produce the same broken template.
@@ -2129,6 +2274,17 @@ async function stageHarnessCode(ctx) {
 // ---------------------------------------------------------------------------
 async function stageLocalScenarioRun(ctx) {
   const s = startStage('localScenarioRun');
+
+  // ── Harness-mode short-circuit (Phase 4) ──────────────────────────────
+  // The harness template is validated by the Phase 1 golden-set suite
+  // (test/harnessGolden.test.js) — not by running its own scenarios against
+  // itself, which would require making outbound HTTP calls in subprocess
+  // from the local runtime. Skip; the real deployed run (testStep) will
+  // validate against the actual target flow.
+  if (ctx.harnessMode === true) {
+    ctx.log('  [harness-mode] skipping localScenarioRun — harness validated by golden-set suite, not self-test');
+    return endStage(s, { skipped: true, reason: 'harness-mode', harnessMode: true });
+  }
 
   const harnessed = ctx.harnessedTemplate;
   if (!harnessed || !harnessed.template) {
@@ -3905,4 +4061,10 @@ module.exports = {
   appendEvent,
   // Exposed for unit tests of the pre-splice local scenario stage (fix 2.2b).
   _stageLocalScenarioRun: stageLocalScenarioRun,
+  // Phase 4 harness-mode stage fns + helpers — exported for integration
+  // testing without spinning up Edison flows.
+  _stagePlaybook: stagePlaybook,
+  _stageGenerateCode: stageGenerateCode,
+  _stageHarnessCode: stageHarnessCode,
+  _buildHarnessedHarnessTemplate: buildHarnessedHarnessTemplate,
 };
