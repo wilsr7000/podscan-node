@@ -1558,7 +1558,21 @@ async function stageGenerateCode(ctx) {
     }
 
     if (attempt > 1 || allPrior.length > 0) {
-      const lastGoodCode = ctx.priorDiagnosis?.lastCode || (priorFailures?.[0]?.result?.result?.code) || (priorFailures?.[0]?.result?.code) || '';
+      // lastGoodCode fallback chain — tries increasingly-broad sources for
+      // the previously-generated code so patch mode's logicSource is always
+      // populated. Without this, Generate Step Code rejects patch requests
+      // with PATCH_NO_TEMPLATE. ctx.generatedCode is the canonical slot the
+      // pipeline populates on stage success AND on resume rehydration —
+      // checking it here closes the gap where callers set an empty
+      // priorDiagnosis.lastCode (as our programmatic priorDiagnosis retry
+      // scripts sometimes do).
+      const lastGoodCode = ctx.priorDiagnosis?.lastCode
+        || ctx.generatedCode
+        || ctx.codeGenResult?.result?.code
+        || ctx.codeGenResult?.code
+        || (priorFailures?.[0]?.result?.result?.code)
+        || (priorFailures?.[0]?.result?.code)
+        || '';
       const instructionParts = [
         'This is a corrective retry. The previous attempt(s) failed these acceptance gates:',
         ...allPrior.map((r, i) => `  ${i + 1}. ${r}`),

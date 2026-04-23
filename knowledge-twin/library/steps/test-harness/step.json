@@ -1,0 +1,116 @@
+{
+  "name": "Test Harness",
+  "label": "Test Harness (Flow Tester)",
+  "description": "Runs a scenario suite against a deployed Edison flow endpoint. For each scenario, POSTs the input, polls until complete, diffs the actual response against the expected outcome. Emits per-scenario results plus an aggregate verdict. Trust anchor: hand-built, not pipeline-generated — used to validate every other flow the pipeline ships. Versioned independently so test records can pin to a specific harness revision.",
+  "version": "1.0.0",
+  "kind": "logic",
+  "icon": "check-square",
+  "shape": "circle",
+  "size": "small",
+  "service": "Pipeline",
+  "categories": [
+    "Testing",
+    "Quality"
+  ],
+  "modules": [],
+  "inputs": [
+    {
+      "variable": "targetFlowUrl",
+      "label": "Target Flow URL",
+      "type": "text",
+      "required": true,
+      "helpText": "Full URL of the flow endpoint to test — e.g. `https://em.edison.api.onereach.ai/http/<account>/<path>`. The harness will POST to this URL for each scenario."
+    },
+    {
+      "variable": "scenarios",
+      "label": "Scenarios",
+      "type": "json",
+      "required": true,
+      "helpText": "JSON array of `{ name, input, expect }` objects. `name` is a short label; `input` is the request body for the target flow; `expect` is the match criteria — any of `{ code }`, `{ codeOneOf: [...] }`, `{ codeOneOfOrSuccess: [...] }`, `{ messageIncludes }`, `{ shape: { field: 'type' } }`."
+    },
+    {
+      "variable": "timeoutMs",
+      "label": "Per-scenario timeout (ms)",
+      "type": "number",
+      "required": false,
+      "default": "`30000`",
+      "helpText": "Maximum wall-clock time for a single scenario including poll cycles. Default 30 seconds."
+    },
+    {
+      "variable": "pollDelayMs",
+      "label": "Poll interval (ms)",
+      "type": "number",
+      "required": false,
+      "default": "`2500`",
+      "helpText": "Sleep between polls of the target flow's async status endpoint. Default 2.5 seconds."
+    },
+    {
+      "variable": "maxPolls",
+      "label": "Max polls per scenario",
+      "type": "number",
+      "required": false,
+      "default": "`20`",
+      "helpText": "Cap on poll attempts per scenario. At `pollDelayMs=2500` and `maxPolls=20`, a scenario times out after ~50 seconds of polling. Default 20."
+    },
+    {
+      "variable": "failFast",
+      "label": "Stop on first failure",
+      "type": "boolean",
+      "required": false,
+      "default": "`false`",
+      "helpText": "If true, the first failing scenario ends the run. If false (default), all scenarios run so the full diff set is visible. Use true for CI gates; false for forensic runs."
+    }
+  ],
+  "exits": [
+    { "id": "next", "label": "All passed" },
+    { "id": "failures", "label": "Some failed" },
+    { "id": "__error__", "label": "Harness error", "condition": "processError" },
+    { "id": "__timeout__", "label": "Timeout", "condition": "processTimeout" }
+  ],
+  "data": {
+    "exits": [
+      { "id": "next", "label": "All passed" },
+      { "id": "failures", "label": "Some failed" },
+      { "id": "__error__", "label": "Harness error", "condition": "processError" },
+      { "id": "__timeout__", "label": "Timeout", "condition": "processTimeout" }
+    ],
+    "processError": true,
+    "processTimeout": true,
+    "timeoutDuration": "`300 sec`",
+    "dataOut": {
+      "name": "harnessResult",
+      "type": "session",
+      "ttl": 86400000
+    }
+  },
+  "outputExample": {
+    "verdict": "fail",
+    "summary": {
+      "total": 5,
+      "passed": 3,
+      "failed": 2,
+      "skipped": 0,
+      "durationMs": 14532
+    },
+    "results": [
+      {
+        "name": "happy path",
+        "ok": true,
+        "phase": "poll-done",
+        "actual": { "code": null, "message": "Success" },
+        "diff": [],
+        "elapsedMs": 3450
+      },
+      {
+        "name": "missing required field",
+        "ok": false,
+        "phase": "poll-done",
+        "actual": { "code": "UNEXPECTED_CODE" },
+        "diff": [
+          { "field": "code", "expectedOneOf": ["MISSING_INPUT", "INVALID_INPUT"], "actual": "UNEXPECTED_CODE" }
+        ],
+        "elapsedMs": 2890
+      }
+    ]
+  }
+}
