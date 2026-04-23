@@ -1,0 +1,166 @@
+{
+  "name": "Design Step",
+  "label": "Design Step",
+  "description": "Step Building Pipeline — Stage 0: Design. Two modes: (1) designStep: takes a natural language description and generates a step.json spec with logic plan using Claude. (2) buildAsyncUI: takes a flowId + templateId + UI playbook and builds or improves an async module UI on an existing step. Inputs vary by action. Returns: spec/logicPlan or async UI build result.",
+  "version": "2.1.7",
+  "kind": "api",
+  "icon": "architecture",
+  "iconPattern": "mandala",
+  "shape": "circle",
+  "size": "small",
+  "service": "Step Builder",
+  "categories": ["Pre-release", "Builder", "Pipeline", "AI"],
+  "modules": [
+    { "name": "or-sdk", "version": "^1.0.0" },
+    { "name": "@or-sdk/flows", "version": "^1" },
+    { "name": "@or-sdk/files-sync-node", "version": "0.0.6" }
+  ],
+  "processTimeout": true,
+  "timeout": "`180 sec`",
+  "inputs": [
+    {
+      "variable": "action",
+      "label": "Action",
+      "type": "select",
+      "required": true,
+      "allowMergeFields": true,
+      "default": "`${await this.mergeFields['httpCall'].get({path: 'request.body.action'}) || 'designStep'}`",
+      "options": [
+        { "label": "Design Step (from description)", "value": "`designStep`" },
+        { "label": "Build Async UI (on existing step)", "value": "`buildAsyncUI`" }
+      ],
+      "helpText": "Choose what to do: design a new step from a description, or build/improve an async UI on an existing deployed step. Default reads from POST body.action; falls back to 'designStep' when absent."
+    },
+    {
+      "variable": "description",
+      "label": "Step description",
+      "type": "textarea",
+      "required": false,
+      "visibleWhen": { "action": "designStep" },
+      "helpText": "Natural language description of what the step should do. Be specific about inputs, outputs, APIs, and behavior."
+    },
+    {
+      "variable": "service",
+      "label": "Service category",
+      "type": "text",
+      "required": false,
+      "visibleWhen": { "action": "designStep" },
+      "helpText": "Service category (e.g. 'RSS', 'API', 'Data', 'Files'). Helps the LLM choose appropriate modules and patterns."
+    },
+    {
+      "variable": "context",
+      "label": "Additional context",
+      "type": "textarea",
+      "required": false,
+      "visibleWhen": { "action": "designStep" },
+      "helpText": "Extra context: API docs, example payloads, constraints, or references to existing steps."
+    },
+    {
+      "variable": "flowId",
+      "label": "Flow ID",
+      "type": "text",
+      "required": false,
+      "visibleWhen": { "action": "buildAsyncUI" },
+      "helpText": "UUID of the Edison flow containing the step to build a UI for."
+    },
+    {
+      "variable": "templateId",
+      "label": "Template ID",
+      "type": "text",
+      "required": false,
+      "visibleWhen": { "action": "buildAsyncUI" },
+      "helpText": "UUID of the step template within the flow. The async module will be wired into this template."
+    },
+    {
+      "variable": "uiPlan",
+      "label": "UI Playbook",
+      "type": "textarea",
+      "required": false,
+      "visibleWhen": { "action": "buildAsyncUI" },
+      "helpText": "Describe the UI you want: field grouping, sections, conditional visibility, help text strategy, tooltips, modal patterns. The LLM uses this as its design brief."
+    },
+    {
+      "variable": "activate",
+      "label": "Activate flow after save",
+      "type": "switch",
+      "required": false,
+      "default": false,
+      "visibleWhen": { "action": "buildAsyncUI" },
+      "helpText": "When enabled, the flow is automatically activated after saving the updated UI."
+    },
+    {
+      "variable": "model",
+      "label": "LLM Model",
+      "type": "text",
+      "required": false,
+      "default": "`claude-sonnet-4-20250514`",
+      "helpText": "Anthropic model ID. Sonnet for async UI building, Opus for step design."
+    },
+    {
+      "variable": "auth",
+      "label": "Anthropic API Key",
+      "type": "auth",
+      "required": false,
+      "config": {
+        "collection": "__authorization_service_Anthropic",
+        "authType": "token",
+        "fieldList": [{ "masked": true, "fieldName": "auth", "fieldLabel": "API Key" }]
+      }
+    },
+    {
+      "variable": "apiKey",
+      "label": "Anthropic API Key (plain-text override)",
+      "type": "text",
+      "required": false,
+      "helpText": "Optional plain-text Anthropic API key. When provided, takes priority over the auth-external-component. Used by the pipeline orchestrator to forward ANTHROPIC_API_KEY via body.apiKey (matches Conceive Step's pattern)."
+    },
+    {
+      "variable": "playbookID",
+      "label": "Playbook ID",
+      "type": "text",
+      "required": false,
+      "allowMergeFields": true,
+      "default": "`${await this.mergeFields['httpCall'].get({path: 'request.body.playbookID'})}`",
+      "helpText": "UUID of a KV-backed playbook state entry. When provided, DesignStep reads prior-stage outputs (stages.splice.flowId / stages.harnessCode.template) from KV and writes stages.designUI back with its results."
+    },
+    {
+      "variable": "playbookCollection",
+      "label": "Playbook KV collection",
+      "type": "text",
+      "required": false,
+      "allowMergeFields": true,
+      "default": "`playbooks`",
+      "helpText": "KV collection name for the playbook state entry. Defaults to 'playbooks'. Only used when playbookID is also provided."
+    },
+    {
+      "variable": "playbookKey",
+      "label": "Playbook KV key",
+      "type": "text",
+      "required": false,
+      "allowMergeFields": true,
+      "default": "`${await this.mergeFields['httpCall'].get({path: 'request.body.playbookKey'})}`",
+      "helpText": "KV key for the playbook state entry. Defaults to the playbookID when omitted. Only used when playbookID is also provided."
+    }
+  ],
+  "exits": [
+    { "id": "next", "label": "next" },
+    { "id": "__error__", "label": "on error", "condition": "processError" },
+    { "id": "__timeout__", "label": "on timeout", "condition": "processTimeout" }
+  ],
+  "dataOut": {
+    "name": "designResult",
+    "type": "session",
+    "ttl": 86400000
+  },
+  "outputExample": {
+    "action": "buildAsyncUI",
+    "status": "ok",
+    "templateLabel": "My Step",
+    "fieldsCount": 5,
+    "evaluation": {
+      "prior": { "design": 72, "module": 60, "combined": 65 },
+      "improved": { "design": 88, "module": 85, "combined": 86 },
+      "delta": 21
+    }
+  }
+}
