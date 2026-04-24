@@ -35,25 +35,33 @@ function mkServer({ kv = new Map(), graphBehavior = 'ok' } = {}) {
     req.on('end', () => {
       const url = new URL(req.url, 'http://localhost');
 
-      // /keyvalue — GET + POST
+      // /keyvalue — GET (read) + PUT (write) to match Edison's real shape
+      // (NOT POST — POST hits a list endpoint; verified against production).
       if (url.pathname.endsWith('/keyvalue')) {
         if (req.method === 'GET') {
           const id = url.searchParams.get('id');
           const key = url.searchParams.get('key');
           const k = `${id}/${key}`;
-          const val = kv.get(k);
-          if (!val) {
-            res.writeHead(404); res.end(JSON.stringify({ error: 'not-found' })); return;
+          const storedString = kv.get(k);
+          if (!storedString) {
+            // Edison returns 200 with Status message for not-found, not 404
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ Status: 'No data found.' }));
+            return;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(val));
+          res.end(JSON.stringify({ value: storedString }));
           return;
         }
-        if (req.method === 'POST') {
+        if (req.method === 'PUT') {
           let body = {};
           try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch {}
-          const k = `${body.id}/${body.key}`;
-          kv.set(k, body.value);
+          // Edison stores `itemValue` (stringified) — NOT `value`
+          const id = body.id || url.searchParams.get('id');
+          const key = body.key || url.searchParams.get('key');
+          const k = `${id}/${key}`;
+          const stored = typeof body.itemValue === 'string' ? body.itemValue : JSON.stringify(body.itemValue);
+          kv.set(k, stored);
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
           return;
@@ -232,7 +240,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('addPlaybookAsset appends a new asset and persists to KV', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -245,7 +253,7 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.playbook.assets.length, 1);
       assertEq(r.playbook.assets[0].kind, 'detailed-plan');
       // KV was actually written
-      const stored = kv.get('riff:sheets/pb-1');
+      const stored = JSON.parse(kv.get('riff:sheets/pb-1'));
       assertEq(stored.assets.length, 1);
       assertEq(stored.assets[0].id, 'a-1');
       assert(typeof stored.updated_at === 'number', 'updated_at stamped as epoch millis');
@@ -255,11 +263,11 @@ function installFetchRewrite(mockUrl) {
 
   await test('addPlaybookAsset replaces by id on re-run (same kind:playbookId:jobId)', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', {
+    kv.set('riff:sheets/pb-1', JSON.stringify({
       id: 'pb-1',
       title: 'Test',
       assets: [{ id: 'a-1', kind: 'detailed-plan', content: 'v1' }],
-    });
+    }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -286,7 +294,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('addPlaybookAssets batches multiple assets in one KV write', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -301,7 +309,7 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.ok, true);
       assertEq(r.assetIds.length, 3);
       assertEq(r.playbook.assets.length, 3);
-      const stored = kv.get('riff:sheets/pb-1');
+      const stored = JSON.parse(kv.get('riff:sheets/pb-1'));
       assertEq(stored.assets.length, 3);
     } finally { restore(); await srv.close(); }
   });
@@ -310,7 +318,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('syncGraph:true (default) calls the graph proxy', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -324,7 +332,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('graph proxy HTTP 500 does NOT fail the write — ok:true, synced:false', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [] });
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [] }));
     const srv = await mkServer({ kv, graphBehavior: 'error-500' });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -334,13 +342,13 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.ok, true);
       assertEq(r.synced, false);
       // KV still written
-      assertEq(kv.get('riff:sheets/pb-1').assets.length, 1);
+      assertEq(JSON.parse(kv.get('riff:sheets/pb-1')).assets.length, 1);
     } finally { restore(); await srv.close(); }
   });
 
   await test('syncGraph:false skips the proxy entirely', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [] });
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [] }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -355,9 +363,9 @@ function installFetchRewrite(mockUrl) {
 
   await test('getPlaybookAsset returns the matching asset by id', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [
       { id: 'a1', kind: 'x' }, { id: 'a2', kind: 'y' },
-    ]});
+    ]}));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -372,11 +380,11 @@ function installFetchRewrite(mockUrl) {
 
   await test('listPlaybookAssets filters by kind', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [
       { id: 'a1', kind: 'detailed-plan' },
       { id: 'a2', kind: 'step-spec' },
       { id: 'a3', kind: 'detailed-plan' },
-    ]});
+    ]}));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {

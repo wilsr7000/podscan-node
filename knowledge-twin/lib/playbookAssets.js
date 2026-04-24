@@ -75,6 +75,28 @@ const GRAPH_PROXY_URL = `${BASE_URL}/${GRAPH_PROXY_PATH.replace(/^\//, '')}`;
 // ---------------------------------------------------------------------------
 // Low-level KV read/write. Matches playbookStore's HTTP contract.
 // ---------------------------------------------------------------------------
+// Edison KV wraps stored values as { value: <payload> }. WISER's
+// cloudSaveSheet writes the playbook as a JSON-stringified string INSIDE
+// `value`, so reads come back as `{ value: "<stringified JSON>" }`. If
+// we read and write without re-parsing/re-stringifying, we corrupt
+// WISER's encoding convention — the playbook body becomes a raw object
+// that WISER's reader treats as a character array, and critical fields
+// like createdInWiser disappear.
+//
+// kvGet: unwraps { value } AND re-parses value if it's a JSON string.
+// kvPut: always re-stringifies the body before PUT, so round-trips
+//        preserve WISER's encoding.
+// Edison KV wire format (verified against lib/playbookStore.js::_kvPut /
+// _kvGet which are the working pattern in production):
+//   - WRITE: PUT to `/keyvalue?id=<coll>&key=<key>`
+//            body: { id, key, itemValue: <JSON-stringified body> }
+//   - READ:  GET to `/keyvalue?id=<coll>&key=<key>`
+//            response: { value: "<JSON-stringified body>" }
+//                      or { Status: "No data found." }
+//
+// Note the unusual POST→PUT shift and the field-name `itemValue` (not
+// `value`). POSTing to /keyvalue without these params hits a list
+// endpoint that returns { key: [...] } — silently fails as a write.
 async function kvGet(collection, key) {
   const url = `${BASE_URL}/keyvalue?id=${encodeURIComponent(collection)}&key=${encodeURIComponent(key)}`;
   const resp = await fetch(url, { headers: { accept: 'application/json' } });
@@ -83,26 +105,30 @@ async function kvGet(collection, key) {
     const txt = await resp.text().catch(() => '');
     throw new Error(`KV get failed: HTTP ${resp.status} — ${txt.slice(0, 200)}`);
   }
-  const body = await resp.json().catch(() => null);
-  // Edison's KV wraps values as `{ value, ... }` or returns the raw value
-  if (body && typeof body === 'object' && 'value' in body && Object.keys(body).length <= 3) {
-    return body.value;
+  const body = await resp.json().catch(() => ({}));
+  // Edison's "key does not exist" signal
+  if (body && body.Status === 'No data found.') return null;
+  // Extract the stringified value and parse
+  if (body && typeof body.value === 'string') {
+    try { return JSON.parse(body.value); } catch { return body.value; }
   }
-  return body;
+  return body || null;
 }
 
 async function kvPut(collection, key, value) {
-  const url = `${BASE_URL}/keyvalue`;
+  const url = `${BASE_URL}/keyvalue?id=${encodeURIComponent(collection)}&key=${encodeURIComponent(key)}`;
+  // Edison expects itemValue as a JSON-stringified string; always stringify
+  const wireValue = (typeof value === 'string') ? value : JSON.stringify(value);
   const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: collection, key, value }),
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: collection, key, itemValue: wireValue }),
   });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
     throw new Error(`KV put failed: HTTP ${resp.status} — ${txt.slice(0, 200)}`);
   }
-  return resp.json().catch(() => ({}));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
