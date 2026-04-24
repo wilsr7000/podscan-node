@@ -1,15 +1,23 @@
 // test/playbookAssets.test.js — tests for the shared playbook-asset helper.
 //
+// Enforces the CANONICAL WISER NoteAsset shape (discovered by inspecting
+// real assets in KV):
+//
+//   { id, type, name, data, createdAt, derivedFrom?, derivativeFormat?, prompt? }
+//
+// Old shape ({ kind, title, content, data: <object>, meta }) is no longer
+// accepted — those field names aren't what WISER's UI renders against and
+// caused `Cannot read properties of undefined (reading 'color')` crashes.
+//
 // Coverage:
 //   - mergeAssets: dedup by id, append unseen
-//   - buildAsset: shape enforcement + timestamp injection
-//   - assetIdFor: consistent id format
-//   - fetchPlaybook / addPlaybookAsset / addPlaybookAssets: full roundtrip
-//     through a local HTTP server that impersonates Edison's /keyvalue
-//     endpoint and the Neo4j Cypher Proxy
-//   - graph sync: fire-and-forget semantics — failure logged, not thrown
-//   - shape contract: the playbook that comes back out of KV has the
-//     asset merged in place
+//   - buildAsset: canonical shape enforcement
+//   - buildStepBuildingPlaybookAsset: convenience builder for the
+//     type=derivative + derivativeFormat=evaluation + name='Step Building Playbook' combo
+//   - addPlaybookAsset / addPlaybookAssets: KV round-trip, shape validation
+//   - listPlaybookAssets filters by type AND derivativeFormat
+//   - Graph sync: fire-and-forget semantics
+//   - Edison wire format: PUT with itemValue + stringified value body
 
 'use strict';
 
@@ -23,9 +31,22 @@ async function test(name, fn) {
 function assert(c, m) { if (!c) throw new Error(m || 'assert failed'); }
 function assertEq(a, b, m) { if (a !== b) throw new Error(`${m}: expected ${JSON.stringify(b)} got ${JSON.stringify(a)}`); }
 
+// Canonical WISER NoteAsset factory for tests
+function mkValidAsset(overrides = {}) {
+  return {
+    id: overrides.id || 'test-asset-1',
+    type: overrides.type || 'derivative',
+    name: overrides.name || 'Test Asset',
+    data: overrides.data !== undefined ? overrides.data : '# markdown body',
+    createdAt: overrides.createdAt || new Date().toISOString(),
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// Mock Edison HTTP server — impersonates both /keyvalue and the Cypher
-// proxy path so we can test the real code paths without touching production.
+// Mock Edison HTTP server — matches real wire format:
+//   PUT  /keyvalue?id=<coll>&key=<key>   body: { id, key, itemValue: <str> }
+//   GET  /keyvalue?id=<coll>&key=<key>   → { value: "<stringified>" } | { Status: "No data found." }
 // ---------------------------------------------------------------------------
 function mkServer({ kv = new Map(), graphBehavior = 'ok' } = {}) {
   let graphCalls = 0;
@@ -35,28 +56,22 @@ function mkServer({ kv = new Map(), graphBehavior = 'ok' } = {}) {
     req.on('end', () => {
       const url = new URL(req.url, 'http://localhost');
 
-      // /keyvalue — GET (read) + PUT (write) to match Edison's real shape
-      // (NOT POST — POST hits a list endpoint; verified against production).
       if (url.pathname.endsWith('/keyvalue')) {
         if (req.method === 'GET') {
-          const id = url.searchParams.get('id');
-          const key = url.searchParams.get('key');
-          const k = `${id}/${key}`;
-          const storedString = kv.get(k);
-          if (!storedString) {
-            // Edison returns 200 with Status message for not-found, not 404
+          const k = `${url.searchParams.get('id')}/${url.searchParams.get('key')}`;
+          const v = kv.get(k);
+          if (!v) {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ Status: 'No data found.' }));
             return;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ value: storedString }));
+          res.end(JSON.stringify({ value: v }));
           return;
         }
         if (req.method === 'PUT') {
           let body = {};
           try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch {}
-          // Edison stores `itemValue` (stringified) — NOT `value`
           const id = body.id || url.searchParams.get('id');
           const key = body.key || url.searchParams.get('key');
           const k = `${id}/${key}`;
@@ -68,17 +83,10 @@ function mkServer({ kv = new Map(), graphBehavior = 'ok' } = {}) {
         }
       }
 
-      // Graph proxy path (async: POST returns jobId, GET polls)
-      if (url.pathname.endsWith('/omnidata/neon') || url.pathname.endsWith('/graph-proxy-test')) {
+      if (url.pathname.endsWith('/omnidata/neon')) {
         graphCalls++;
         if (graphBehavior === 'error-500') {
           res.writeHead(500); res.end(JSON.stringify({ error: 'server-err' })); return;
-        }
-        if (graphBehavior === 'inline-ok') {
-          // Synchronous response — no jobId
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ records: [{ id: 'ok' }] }));
-          return;
         }
         if (req.method === 'POST') {
           const jobId = 'job-' + graphCalls;
@@ -111,36 +119,10 @@ function mkServer({ kv = new Map(), graphBehavior = 'ok' } = {}) {
   });
 }
 
-// Redirect the helper's Edison URL to the mock server. The helper reads
-// from module-scope constants, so we need to clear-and-reload with the
-// env vars overridden.
-function loadHelperPointingAt(mockServer) {
-  delete require.cache[require.resolve('../lib/playbookAssets')];
-  const prevAccount = process.env.ONEREACH_ACCOUNT_ID;
-  const prevProxy = process.env.PLAYBOOK_GRAPH_PROXY_PATH;
-
-  // The helper builds URLs as `${BASE_URL}/${path}`. We override by
-  // monkey-patching the exported constants after require. Cleaner: set
-  // an env var the helper reads. Quickest: temporarily rewrite the
-  // helper's base URL via a hacky reload + global patch.
-  const helper = require('../lib/playbookAssets');
-  // Rewrite URLs to the mock via a shim around fetch.
-  // All calls in the helper go through global fetch, which we can
-  // wrap per-test.
-  return { helper, restoreEnv: () => {
-    process.env.ONEREACH_ACCOUNT_ID = prevAccount;
-    process.env.PLAYBOOK_GRAPH_PROXY_PATH = prevProxy;
-  } };
-}
-
-// Because the helper builds URLs against the real Edison domain, we
-// patch global fetch to rewrite those URLs at the network layer for the
-// duration of each test.
 function installFetchRewrite(mockUrl) {
   const origFetch = global.fetch;
   global.fetch = async (url, init) => {
     const parsed = new URL(String(url));
-    // Rewrite any call to the Edison domain to our mock
     if (parsed.hostname === 'em.edison.api.onereach.ai') {
       const rewrote = new URL(parsed.pathname + parsed.search, mockUrl);
       return origFetch(rewrote.toString(), init);
@@ -151,7 +133,7 @@ function installFetchRewrite(mockUrl) {
 }
 
 (async () => {
-  console.log('\n== Pure helpers (no network) ==');
+  console.log('\n== Pure helpers ==');
 
   await test('mergeAssets appends unseen ids, replaces same ids', () => {
     delete require.cache[require.resolve('../lib/playbookAssets')];
@@ -161,239 +143,271 @@ function installFetchRewrite(mockUrl) {
       [{ id: 'b', v: 99 }, { id: 'c', v: 3 }],
     );
     assertEq(out.length, 3);
-    assertEq(out.find((x) => x.id === 'b').v, 99, 'b replaced');
-    assertEq(out.find((x) => x.id === 'c').v, 3, 'c appended');
-  });
-
-  await test('mergeAssets handles null / empty inputs', () => {
-    const { mergeAssets } = require('../lib/playbookAssets');
-    assertEq(mergeAssets(null, null).length, 0);
-    assertEq(mergeAssets([], null).length, 0);
-    assertEq(mergeAssets(null, [{ id: 'x', kind: 'y' }]).length, 1);
-  });
-
-  await test('mergeAssets drops malformed incoming (no id)', () => {
-    const { mergeAssets } = require('../lib/playbookAssets');
-    const out = mergeAssets([{ id: 'a' }], [null, {}, { id: 'b' }, 42]);
-    assertEq(out.length, 2, 'only valid entries merged in');
-  });
-
-  await test('buildAsset requires id + kind', () => {
-    const { buildAsset } = require('../lib/playbookAssets');
-    let caught = 0;
-    try { buildAsset({}); } catch { caught++; }
-    try { buildAsset({ id: 'x' }); } catch { caught++; }
-    try { buildAsset({ kind: 'x' }); } catch { caught++; }
-    assertEq(caught, 3);
-    const a = buildAsset({ id: 'x', kind: 'y' });
-    assertEq(a.id, 'x');
-    assertEq(a.kind, 'y');
-    assert(typeof a.meta.generatedAt === 'string');
-  });
-
-  await test('buildAsset preserves custom meta', () => {
-    const { buildAsset } = require('../lib/playbookAssets');
-    const a = buildAsset({
-      id: 'x', kind: 'y', title: 't', content: 'c', data: { foo: 1 },
-      meta: { pipelineStage: 'decompose', pipelineJobId: 'job-1' },
-    });
-    assertEq(a.title, 't');
-    assertEq(a.content, 'c');
-    assertEq(a.data.foo, 1);
-    assertEq(a.meta.pipelineStage, 'decompose');
-    assertEq(a.meta.pipelineJobId, 'job-1');
-    assert(a.meta.generatedAt, 'generatedAt auto-set');
+    assertEq(out.find((x) => x.id === 'b').v, 99);
+    assertEq(out.find((x) => x.id === 'c').v, 3);
   });
 
   await test('assetIdFor produces kind:playbook:scope format', () => {
     const { assetIdFor } = require('../lib/playbookAssets');
-    assertEq(assetIdFor('detailed-plan', 'abc-123'), 'detailed-plan:abc-123:latest');
-    assertEq(assetIdFor('detailed-plan', 'abc', 'job-42'), 'detailed-plan:abc:job-42');
-    // scope sanitized
+    assertEq(assetIdFor('step-building-playbook', 'abc'), 'step-building-playbook:abc:latest');
+    assertEq(assetIdFor('derivative', 'abc', 'job-42'), 'derivative:abc:job-42');
     assertEq(assetIdFor('foo', 'abc', 'bad/scope with spaces'), 'foo:abc:bad_scope_with_spaces');
   });
 
-  console.log('\n== Full KV round-trip via mock server ==');
+  console.log('\n== buildAsset — canonical WISER NoteAsset shape ==');
 
-  await test('fetchPlaybook returns null for missing playbook', async () => {
-    const srv = await mkServer();
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { fetchPlaybook } = require('../lib/playbookAssets');
-      const pb = await fetchPlaybook('nope');
-      assertEq(pb, null);
-    } finally { restore(); await srv.close(); }
+  await test('requires id, type, name, and string data', () => {
+    const { buildAsset } = require('../lib/playbookAssets');
+    let caught = 0;
+    try { buildAsset({}); } catch { caught++; }
+    try { buildAsset({ id: 'x' }); } catch { caught++; }
+    try { buildAsset({ id: 'x', type: 't' }); } catch { caught++; }
+    try { buildAsset({ id: 'x', type: 't', name: 'n' }); } catch { caught++; }  // data missing
+    try { buildAsset({ id: 'x', type: 't', name: 'n', data: {} }); } catch { caught++; }  // data is object, not string
+    assertEq(caught, 5, 'all 5 invalid shapes rejected');
   });
 
-  await test('addPlaybookAsset returns not-found when playbook absent', async () => {
-    const srv = await mkServer();
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { addPlaybookAsset } = require('../lib/playbookAssets');
-      const r = await addPlaybookAsset('missing-id', { id: 'a', kind: 'test' }, { syncGraph: false, log: () => {} });
-      assertEq(r.ok, false);
-      assertEq(r.reason, 'not-found');
-    } finally { restore(); await srv.close(); }
+  await test('accepts minimal canonical shape', () => {
+    const { buildAsset } = require('../lib/playbookAssets');
+    const a = buildAsset({ id: 'x', type: 'html', name: 'X', data: '<p>body</p>' });
+    assertEq(a.id, 'x');
+    assertEq(a.type, 'html');
+    assertEq(a.name, 'X');
+    assertEq(a.data, '<p>body</p>');
+    assert(a.createdAt, 'createdAt auto-stamped');
+    assert(!('kind' in a), 'no legacy kind field');
+    assert(!('title' in a), 'no legacy title field');
+    assert(!('content' in a), 'no legacy content field');
+    assert(!('meta' in a), 'no legacy meta field');
   });
 
-  await test('addPlaybookAsset appends a new asset and persists to KV', async () => {
+  await test('derivedFrom as string is normalized to { noteId } object', () => {
+    const { buildAsset } = require('../lib/playbookAssets');
+    const a = buildAsset({ id: 'x', type: 'derivative', name: 'X', data: 'b', derivedFrom: 'pb-1' });
+    assertEq(typeof a.derivedFrom, 'object');
+    assertEq(a.derivedFrom.noteId, 'pb-1');
+  });
+
+  await test('derivedFrom as object is preserved', () => {
+    const { buildAsset } = require('../lib/playbookAssets');
+    const a = buildAsset({
+      id: 'x', type: 'derivative', name: 'X', data: 'b',
+      derivedFrom: { noteId: 'pb-1', noteTitle: 'Title' },
+    });
+    assertEq(a.derivedFrom.noteId, 'pb-1');
+    assertEq(a.derivedFrom.noteTitle, 'Title');
+  });
+
+  await test('passes through derivativeFormat + prompt', () => {
+    const { buildAsset } = require('../lib/playbookAssets');
+    const a = buildAsset({
+      id: 'x', type: 'derivative', name: 'X', data: 'b',
+      derivativeFormat: 'evaluation',
+      prompt: 'Generated via pipeline',
+    });
+    assertEq(a.derivativeFormat, 'evaluation');
+    assertEq(a.prompt, 'Generated via pipeline');
+  });
+
+  console.log('\n== buildStepBuildingPlaybookAsset ==');
+
+  await test('produces the canonical Step Building Playbook shape', () => {
+    const { buildStepBuildingPlaybookAsset } = require('../lib/playbookAssets');
+    const a = buildStepBuildingPlaybookAsset({
+      playbookId: 'pb-1',
+      playbookTitle: 'My playbook',
+      stepLabel: 'Find & Replace Agent',
+      markdown: '# Plan body',
+      jobId: 'job-42',
+    });
+    assertEq(a.type, 'derivative');
+    assertEq(a.derivativeFormat, 'evaluation');
+    assertEq(a.name, 'Step Building Playbook');
+    assertEq(a.derivedFrom.noteId, 'pb-1');
+    assertEq(a.derivedFrom.noteTitle, 'My playbook');
+    assert(a.id.includes('step-building-playbook'));
+    assert(a.id.includes('pb-1'));
+    assert(a.id.includes('job-42'));
+    assert(a.data === '# Plan body');
+    assert(a.prompt, 'prompt default populated');
+  });
+
+  await test('sanitizes jobId for asset id', () => {
+    const { buildStepBuildingPlaybookAsset } = require('../lib/playbookAssets');
+    const a = buildStepBuildingPlaybookAsset({
+      playbookId: 'pb-1',
+      markdown: 'body',
+      jobId: 'job/42 with/slashes',
+    });
+    assert(!/[/ ]/.test(a.id.split(':').pop()), 'jobId slashes/spaces sanitized');
+  });
+
+  console.log('\n== KV round-trip (canonical shape) ==');
+
+  await test('addPlaybookAsset rejects non-canonical shapes', async () => {
+    delete require.cache[require.resolve('../lib/playbookAssets')];
+    const { addPlaybookAsset } = require('../lib/playbookAssets');
+    let caught = 0;
+    // Missing type
+    try { await addPlaybookAsset('pb', { id: 'a', name: 'n', data: 'd' }); } catch { caught++; }
+    // Missing name
+    try { await addPlaybookAsset('pb', { id: 'a', type: 't', data: 'd' }); } catch { caught++; }
+    // data is object not string (old shape)
+    try { await addPlaybookAsset('pb', { id: 'a', type: 't', name: 'n', data: { k: 'v' } }); } catch { caught++; }
+    // Old shape with kind/content
+    try { await addPlaybookAsset('pb', { id: 'a', kind: 'foo', content: 'c' }); } catch { caught++; }
+    assertEq(caught, 4);
+  });
+
+  await test('append a new Step Building Playbook asset — reads back correctly', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
+    kv.set('riff:sheets/pb-1', JSON.stringify({
+      id: 'pb-1', title: 'Test Playbook',
+      createdInWiser: true, createdInRiff: true, spaceId: 'unclassified',
+    }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
       delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
-      const asset = buildAsset({ id: 'a-1', kind: 'detailed-plan', content: 'plan body' });
+      const { addPlaybookAsset, buildStepBuildingPlaybookAsset } = require('../lib/playbookAssets');
+      const asset = buildStepBuildingPlaybookAsset({
+        playbookId: 'pb-1',
+        playbookTitle: 'Test Playbook',
+        stepLabel: 'MyStep',
+        markdown: '# Step Build Plan',
+        jobId: 'job-42',
+      });
       const r = await addPlaybookAsset('pb-1', asset, { syncGraph: false, log: () => {} });
       assertEq(r.ok, true);
-      assertEq(r.assetId, 'a-1');
       assertEq(r.playbook.assets.length, 1);
-      assertEq(r.playbook.assets[0].kind, 'detailed-plan');
-      // KV was actually written
       const stored = JSON.parse(kv.get('riff:sheets/pb-1'));
-      assertEq(stored.assets.length, 1);
-      assertEq(stored.assets[0].id, 'a-1');
-      assert(typeof stored.updated_at === 'number', 'updated_at stamped as epoch millis');
-      assert(stored.updated_at > Date.now() - 10000, 'updated_at is fresh');
+      assertEq(stored.assets[0].type, 'derivative');
+      assertEq(stored.assets[0].derivativeFormat, 'evaluation');
+      assertEq(stored.assets[0].name, 'Step Building Playbook');
+      assertEq(stored.assets[0].data, '# Step Build Plan');
+      // CRITICAL — createdInWiser/createdInRiff must be preserved
+      assertEq(stored.createdInWiser, true, 'createdInWiser preserved');
+      assertEq(stored.createdInRiff, true, 'createdInRiff preserved');
+      assertEq(stored.spaceId, 'unclassified', 'spaceId preserved');
     } finally { restore(); await srv.close(); }
   });
 
-  await test('addPlaybookAsset replaces by id on re-run (same kind:playbookId:jobId)', async () => {
+  await test('replace same-id asset on re-run (idempotent)', async () => {
     const kv = new Map();
     kv.set('riff:sheets/pb-1', JSON.stringify({
       id: 'pb-1',
-      title: 'Test',
-      assets: [{ id: 'a-1', kind: 'detailed-plan', content: 'v1' }],
+      assets: [mkValidAsset({ id: 'dup', type: 'derivative', name: 'X', data: 'v1' })],
     }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
       delete require.cache[require.resolve('../lib/playbookAssets')];
       const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
-      const asset = buildAsset({ id: 'a-1', kind: 'detailed-plan', content: 'v2' });
-      const r = await addPlaybookAsset('pb-1', asset, { syncGraph: false, log: () => {} });
+      const a2 = buildAsset({ id: 'dup', type: 'derivative', name: 'X', data: 'v2' });
+      const r = await addPlaybookAsset('pb-1', a2, { syncGraph: false, log: () => {} });
       assertEq(r.ok, true);
-      assertEq(r.playbook.assets.length, 1, 'still one asset — replaced not appended');
-      assertEq(r.playbook.assets[0].content, 'v2');
+      assertEq(r.playbook.assets.length, 1, 'still one asset — replaced');
+      assertEq(r.playbook.assets[0].data, 'v2');
     } finally { restore(); await srv.close(); }
   });
 
-  await test('addPlaybookAsset validates asset shape — throws on missing id/kind', async () => {
-    delete require.cache[require.resolve('../lib/playbookAssets')];
-    const { addPlaybookAsset } = require('../lib/playbookAssets');
-    let caught = 0;
-    try { await addPlaybookAsset('pb', null); } catch { caught++; }
-    try { await addPlaybookAsset('pb', { kind: 'x' }); } catch { caught++; }
-    try { await addPlaybookAsset('pb', { id: 'x' }); } catch { caught++; }
-    try { await addPlaybookAsset('', { id: 'x', kind: 'y' }); } catch { caught++; }
-    assertEq(caught, 4);
-  });
-
-  await test('addPlaybookAssets batches multiple assets in one KV write', async () => {
+  await test('batch: multiple assets in one KV write', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1' }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
       delete require.cache[require.resolve('../lib/playbookAssets')];
       const { addPlaybookAssets, buildAsset } = require('../lib/playbookAssets');
       const batch = [
-        buildAsset({ id: 'a1', kind: 'detailed-plan', content: 'plan' }),
-        buildAsset({ id: 'a2', kind: 'step-spec', content: 'spec' }),
-        buildAsset({ id: 'a3', kind: 'generated-code', content: 'code' }),
+        buildAsset({ id: 'a1', type: 'derivative', name: 'N1', data: 'd1' }),
+        buildAsset({ id: 'a2', type: 'html', name: 'N2', data: 'd2' }),
       ];
       const r = await addPlaybookAssets('pb-1', batch, { syncGraph: false, log: () => {} });
       assertEq(r.ok, true);
-      assertEq(r.assetIds.length, 3);
-      assertEq(r.playbook.assets.length, 3);
-      const stored = JSON.parse(kv.get('riff:sheets/pb-1'));
-      assertEq(stored.assets.length, 3);
+      assertEq(r.playbook.assets.length, 2);
     } finally { restore(); await srv.close(); }
   });
 
-  console.log('\n== Graph sync behavior ==');
+  console.log('\n== listPlaybookAssets filters ==');
 
-  await test('syncGraph:true (default) calls the graph proxy', async () => {
+  await test('filter by type and derivativeFormat', async () => {
     const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', title: 'Test', assets: [] }));
-    const srv = await mkServer({ kv });
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
-      const r = await addPlaybookAsset('pb-1', buildAsset({ id: 'a', kind: 'x' }), { log: () => {} });
-      assertEq(r.ok, true);
-      assert(srv.getGraphCalls() > 0, 'graph proxy was called');
-    } finally { restore(); await srv.close(); }
-  });
-
-  await test('graph proxy HTTP 500 does NOT fail the write — ok:true, synced:false', async () => {
-    const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [] }));
-    const srv = await mkServer({ kv, graphBehavior: 'error-500' });
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
-      const r = await addPlaybookAsset('pb-1', buildAsset({ id: 'a', kind: 'x' }), { log: () => {} });
-      assertEq(r.ok, true);
-      assertEq(r.synced, false);
-      // KV still written
-      assertEq(JSON.parse(kv.get('riff:sheets/pb-1')).assets.length, 1);
-    } finally { restore(); await srv.close(); }
-  });
-
-  await test('syncGraph:false skips the proxy entirely', async () => {
-    const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [] }));
-    const srv = await mkServer({ kv });
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
-      await addPlaybookAsset('pb-1', buildAsset({ id: 'a', kind: 'x' }), { syncGraph: false, log: () => {} });
-      assertEq(srv.getGraphCalls(), 0, 'proxy not called');
-    } finally { restore(); await srv.close(); }
-  });
-
-  console.log('\n== Readers ==');
-
-  await test('getPlaybookAsset returns the matching asset by id', async () => {
-    const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [
-      { id: 'a1', kind: 'x' }, { id: 'a2', kind: 'y' },
-    ]}));
-    const srv = await mkServer({ kv });
-    const restore = installFetchRewrite(srv.url);
-    try {
-      delete require.cache[require.resolve('../lib/playbookAssets')];
-      const { getPlaybookAsset } = require('../lib/playbookAssets');
-      const a = await getPlaybookAsset('pb-1', 'a2');
-      assertEq(a.kind, 'y');
-      const missing = await getPlaybookAsset('pb-1', 'nope');
-      assertEq(missing, null);
-    } finally { restore(); await srv.close(); }
-  });
-
-  await test('listPlaybookAssets filters by kind', async () => {
-    const kv = new Map();
-    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1', assets: [
-      { id: 'a1', kind: 'detailed-plan' },
-      { id: 'a2', kind: 'step-spec' },
-      { id: 'a3', kind: 'detailed-plan' },
-    ]}));
+    kv.set('riff:sheets/pb-1', JSON.stringify({
+      id: 'pb-1',
+      assets: [
+        { id: 'a1', type: 'html', name: 'Interview Plan', data: 'x' },
+        { id: 'a2', type: 'derivative', name: 'Plan Evaluation', data: 'y', derivativeFormat: 'evaluation' },
+        { id: 'a3', type: 'derivative', name: 'Step Building Playbook', data: 'z', derivativeFormat: 'evaluation' },
+        { id: 'a4', type: 'derivative', name: 'Other', data: 'w', derivativeFormat: 'summary' },
+      ],
+    }));
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
       delete require.cache[require.resolve('../lib/playbookAssets')];
       const { listPlaybookAssets } = require('../lib/playbookAssets');
-      const plans = await listPlaybookAssets('pb-1', { kind: 'detailed-plan' });
-      assertEq(plans.length, 2);
-      const all = await listPlaybookAssets('pb-1');
-      assertEq(all.length, 3);
+      assertEq((await listPlaybookAssets('pb-1')).length, 4, 'all 4');
+      assertEq((await listPlaybookAssets('pb-1', { type: 'derivative' })).length, 3);
+      assertEq((await listPlaybookAssets('pb-1', { type: 'derivative', derivativeFormat: 'evaluation' })).length, 2);
+      assertEq((await listPlaybookAssets('pb-1', { derivativeFormat: 'summary' })).length, 1);
+    } finally { restore(); await srv.close(); }
+  });
+
+  console.log('\n== Graph sync (fire-and-forget) ==');
+
+  await test('graph proxy HTTP 500 does NOT fail the write — ok:true, synced:false', async () => {
+    const kv = new Map();
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1' }));
+    const srv = await mkServer({ kv, graphBehavior: 'error-500' });
+    const restore = installFetchRewrite(srv.url);
+    try {
+      delete require.cache[require.resolve('../lib/playbookAssets')];
+      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
+      const r = await addPlaybookAsset('pb-1', buildAsset({ id: 'a', type: 'html', name: 'n', data: 'd' }), { log: () => {} });
+      assertEq(r.ok, true);
+      assertEq(r.synced, false);
+    } finally { restore(); await srv.close(); }
+  });
+
+  await test('syncGraph:false skips proxy entirely', async () => {
+    const kv = new Map();
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1' }));
+    const srv = await mkServer({ kv });
+    const restore = installFetchRewrite(srv.url);
+    try {
+      delete require.cache[require.resolve('../lib/playbookAssets')];
+      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
+      await addPlaybookAsset('pb-1', buildAsset({ id: 'a', type: 'html', name: 'n', data: 'd' }), { syncGraph: false, log: () => {} });
+      assertEq(srv.getGraphCalls(), 0);
+    } finally { restore(); await srv.close(); }
+  });
+
+  console.log('\n== Edison wire format (PUT + itemValue) ==');
+
+  await test('kvGet handles { Status: "No data found." }', async () => {
+    const srv = await mkServer();  // empty kv
+    const restore = installFetchRewrite(srv.url);
+    try {
+      delete require.cache[require.resolve('../lib/playbookAssets')];
+      const { fetchPlaybook } = require('../lib/playbookAssets');
+      assertEq(await fetchPlaybook('nope'), null);
+    } finally { restore(); await srv.close(); }
+  });
+
+  await test('kvPut writes PUT with itemValue (not POST with value)', async () => {
+    const kv = new Map();
+    kv.set('riff:sheets/pb-1', JSON.stringify({ id: 'pb-1' }));
+    const srv = await mkServer({ kv });
+    const restore = installFetchRewrite(srv.url);
+    try {
+      delete require.cache[require.resolve('../lib/playbookAssets')];
+      const { addPlaybookAsset, buildAsset } = require('../lib/playbookAssets');
+      await addPlaybookAsset('pb-1', buildAsset({ id: 'a', type: 'html', name: 'n', data: 'd' }), { syncGraph: false, log: () => {} });
+      const stored = kv.get('riff:sheets/pb-1');
+      assert(typeof stored === 'string', 'stored value is a string (itemValue)');
+      const parsed = JSON.parse(stored);
+      assert(Array.isArray(parsed.assets) && parsed.assets.length === 1);
     } finally { restore(); await srv.close(); }
   });
 

@@ -151,36 +151,94 @@ function mergeAssets(existing, incoming) {
 }
 
 // ---------------------------------------------------------------------------
-// buildAsset — canonical shape constructor. Callers pass the fields that
-// matter to their kind; this fills in timestamps and enforces the shape.
-// Use this when you want to build + pass to a batch write.
+// buildAsset — canonical WISER NoteAsset constructor.
 //
-// Shape:
+// Discovered by inspecting real WISER-authored assets in production KV
+// (see Interview Plan + Plan Evaluation on playbook 27370f27-...). WISER's
+// asset-list renderer reads `type` for the category icon/color and
+// `derivativeFormat` as a sub-kind lookup key. Using the wrong `type`
+// causes a `Cannot read properties of undefined (reading 'color')` crash
+// in the UI and the asset list fails to render at all.
+//
+// Canonical shape:
 //   {
-//     id:       string (required — stable across re-runs)
-//     kind:     string (required — 'detailed-plan' | 'step-spec' |
-//                       'generated-code' | 'test-results' | 'ui-schema' |
-//                       'deployed-flow-ref' | custom)
-//     title?:   string (human-readable label)
-//     content?: string (human-readable body, typically markdown/text)
-//     data?:    any    (structured data keyed to `kind`)
-//     meta?:    { pipelineStage, pipelineJobId, generatedAt, ... }
+//     id:                string (required; stable across re-runs for dedup)
+//     type:              string (required; 'derivative' | 'html' | ...)
+//     name:              string (required; display label in the asset list)
+//     data:              string (required; the rendered body — markdown/HTML
+//                                 the UI displays when the asset is opened)
+//     createdAt:         ISO string
+//     derivedFrom?:      { noteId, noteTitle }   — OBJECT, not a string
+//     derivativeFormat?: string                  — 'evaluation' | ...
+//     prompt?:           string                  — generator prompt for audit
+//   }
+//
+// DO NOT use `kind`, `title`, `content`, or `meta` — those aren't WISER
+// fields and the UI will silently fail to render assets using that shape.
+// The former `buildAsset` API used those names; the switch to canonical
+// shape is intentional and non-backwards-compatible.
+// ---------------------------------------------------------------------------
+function buildAsset({ id, type, name, data, derivedFrom, derivativeFormat, prompt, createdAt } = {}) {
+  if (typeof id !== 'string' || !id) throw new Error('buildAsset: id is required and must be a non-empty string');
+  if (typeof type !== 'string' || !type) throw new Error('buildAsset: type is required (e.g. "derivative", "html")');
+  if (typeof name !== 'string' || !name) throw new Error('buildAsset: name is required');
+  if (typeof data !== 'string') throw new Error('buildAsset: data must be a string (the rendered body — markdown/HTML)');
+
+  const asset = {
+    id,
+    type,
+    name,
+    data,
+    createdAt: typeof createdAt === 'string' ? createdAt : new Date().toISOString(),
+  };
+  if (derivedFrom !== undefined && derivedFrom !== null) {
+    // derivedFrom is an object like { noteId, noteTitle } — normalize a
+    // bare string id into that object shape so callers can pass either.
+    if (typeof derivedFrom === 'string') {
+      asset.derivedFrom = { noteId: derivedFrom };
+    } else if (typeof derivedFrom === 'object') {
+      asset.derivedFrom = derivedFrom;
+    }
+  }
+  if (typeof derivativeFormat === 'string' && derivativeFormat) asset.derivativeFormat = derivativeFormat;
+  if (typeof prompt === 'string' && prompt) asset.prompt = prompt;
+  return asset;
+}
+
+// ---------------------------------------------------------------------------
+// buildStepBuildingPlaybookAsset — convenience builder for the Step Building
+// Playbook (Plan Evaluation-style derivative) produced by stageDecompose.
+//
+// Wraps buildAsset with the right type + derivativeFormat + derivedFrom
+// shape so callers don't have to remember the WISER convention.
+//
+// Input:
+//   {
+//     playbookId,        — the SOURCE playbook id
+//     playbookTitle,     — the source playbook's title (for derivedFrom)
+//     stepLabel,         — human-readable step label, for the asset name
+//     markdown,          — rendered markdown body (what shows in the UI)
+//     jobId,             — pipeline jobId for uniqueness + audit
+//     prompt?,           — optional generator prompt (for audit trail)
 //   }
 // ---------------------------------------------------------------------------
-function buildAsset({ id, kind, title, content, data, meta } = {}) {
-  if (typeof id !== 'string' || !id) throw new Error('buildAsset: id is required and must be a non-empty string');
-  if (typeof kind !== 'string' || !kind) throw new Error('buildAsset: kind is required and must be a non-empty string');
-  return {
-    id,
-    kind,
-    title: typeof title === 'string' ? title : undefined,
-    content: typeof content === 'string' ? content : undefined,
-    data: (data !== undefined && data !== null) ? data : undefined,
-    meta: {
-      generatedAt: new Date().toISOString(),
-      ...(meta && typeof meta === 'object' ? meta : {}),
+function buildStepBuildingPlaybookAsset({ playbookId, playbookTitle, stepLabel, markdown, jobId, prompt } = {}) {
+  if (!playbookId) throw new Error('buildStepBuildingPlaybookAsset: playbookId required');
+  if (typeof markdown !== 'string') throw new Error('buildStepBuildingPlaybookAsset: markdown body required');
+  const scopeKey = String(jobId || 'latest').replace(/[^A-Za-z0-9_-]/g, '_');
+  const stepLabelForName = stepLabel || 'Step';
+  return buildAsset({
+    id: `derivative:step-building-playbook:${playbookId}:${scopeKey}`,
+    type: 'derivative',               // rendered as a derivative in WISER UI
+    name: 'Step Building Playbook',   // human label in the asset list
+    data: markdown,
+    derivedFrom: {
+      noteId: playbookId,
+      noteTitle: playbookTitle || '',
     },
-  };
+    derivativeFormat: 'evaluation',   // verified format that WISER renders
+    prompt: prompt || `Step building playbook for "${stepLabelForName}" — generated via sectioned plan pipeline (11 sections).`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -314,8 +372,8 @@ async function addPlaybookAsset(playbookId, asset, options = {}) {
   if (typeof playbookId !== 'string' || !playbookId) {
     throw new Error('addPlaybookAsset: playbookId required');
   }
-  if (!asset || typeof asset !== 'object' || !asset.id || !asset.kind) {
-    throw new Error('addPlaybookAsset: asset must be an object with { id, kind, ... }');
+  if (!asset || typeof asset !== 'object' || !asset.id || !asset.type || !asset.name || typeof asset.data !== 'string') {
+    throw new Error('addPlaybookAsset: asset must be a canonical WISER NoteAsset with { id, type, name, data: <string>, ... }. Use buildAsset() or buildStepBuildingPlaybookAsset() to construct it.');
   }
 
   log(`[playbookAssets] fetching ${collection}/${playbookId}...`);
@@ -371,8 +429,8 @@ async function addPlaybookAssets(playbookId, assets, options = {}) {
     return { ok: true, playbook: null, assetIds: [], synced: false, reason: 'no-assets' };
   }
   for (const a of assets) {
-    if (!a || typeof a !== 'object' || !a.id || !a.kind) {
-      throw new Error('addPlaybookAssets: every asset must be { id, kind, ... }');
+    if (!a || typeof a !== 'object' || !a.id || !a.type || !a.name || typeof a.data !== 'string') {
+      throw new Error('addPlaybookAssets: every asset must be a canonical WISER NoteAsset with { id, type, name, data: <string>, ... }');
     }
   }
 
@@ -422,13 +480,20 @@ async function getPlaybookAsset(playbookId, assetId, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// listPlaybookAssets — read all assets, optionally filtered by kind.
+// listPlaybookAssets — read all assets, optionally filtered by type
+// and/or derivativeFormat.
+//
+//   listPlaybookAssets(pbId, { type: 'derivative' })                  → all derivatives
+//   listPlaybookAssets(pbId, { type: 'derivative', derivativeFormat: 'evaluation' })  → Plan Evaluations / Step Building Playbooks
+//   listPlaybookAssets(pbId, { derivedFormat: 'evaluation' })         → shorthand alias
 // ---------------------------------------------------------------------------
-async function listPlaybookAssets(playbookId, { kind, collection = KV_COLLECTION_DEFAULT } = {}) {
+async function listPlaybookAssets(playbookId, { type, derivativeFormat, collection = KV_COLLECTION_DEFAULT } = {}) {
   const pb = await fetchPlaybook(playbookId, { collection });
   if (!pb) return [];
-  const assets = pb.assets || [];
-  return typeof kind === 'string' ? assets.filter((a) => a.kind === kind) : assets;
+  let assets = pb.assets || [];
+  if (typeof type === 'string') assets = assets.filter((a) => a.type === type);
+  if (typeof derivativeFormat === 'string') assets = assets.filter((a) => a.derivativeFormat === derivativeFormat);
+  return assets;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +515,11 @@ module.exports = {
   // Write
   addPlaybookAsset,
   addPlaybookAssets,
-  // Helpers
+  // Generic builder (canonical WISER NoteAsset shape)
   buildAsset,
+  // Specialized builder for Step Building Playbooks (plan evaluation derivative)
+  buildStepBuildingPlaybookAsset,
+  // Utilities
   mergeAssets,
   assetIdFor,
   syncPlaybookToGraph,
