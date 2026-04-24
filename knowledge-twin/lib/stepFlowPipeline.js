@@ -1111,20 +1111,55 @@ async function stageDecompose(ctx) {
 
   const focus = ctx.opts.focus || undefined;
   const maxIterations = ctx.opts.maxIterations || 6;
+  const { getApiKey } = require('./llmClient');
+  const apiKey = ctx.opts.apiKey || getApiKey() || process.env.ANTHROPIC_API_KEY;
+
+  // ── Idempotency check ─────────────────────────────────────────────
+  // If the source playbook already has a fresh `detailed-plan` asset
+  // (schema version matches current generator), skip the heavy work
+  // and reuse it. The caller can override with --regenerate-plan
+  // (ctx.opts.regeneratePlan === true).
+  //
+  // This makes decompose effectively a cache lookup on re-runs of the
+  // same playbook, and exactly one authoring pass per unique playbook.
+  if (ctx.playbookHandle?.id && !ctx.opts?.regeneratePlan) {
+    try {
+      const { listPlaybookAssets } = require('./playbookAssets');
+      const { PLAN_SCHEMA_VERSION } = require('./detailedPlanGenerator');
+      const existing = await listPlaybookAssets(ctx.playbookHandle.id, {
+        collection: ctx.playbookHandle.collection,
+        kind: 'detailed-plan',
+      });
+      // Pick the newest plan asset whose stored schemaVersion matches.
+      const fresh = existing
+        .filter((a) => a?.data?.schemaVersion === PLAN_SCHEMA_VERSION)
+        .sort((a, b) => String(b?.meta?.generatedAt || '').localeCompare(String(a?.meta?.generatedAt || '')))
+        .shift();
+      if (fresh) {
+        const d = fresh.data || {};
+        ctx.bestPlan = d.bestPlan || fresh.content || '';
+        ctx.objective = d.objective || extractObjective(ctx.bestPlan || '');
+        ctx.extractedSpec = d.extracted || null;
+        ctx.planEvaluation = d.planEvaluation || null;
+        ctx.log(`  [idempotent] reused existing detailed-plan asset ${fresh.id} (generated ${fresh.meta?.generatedAt || 'unknown'})`);
+        return endStage(s, {
+          reused: true,
+          assetId: fresh.id,
+          schemaVersion: d.schemaVersion,
+          objectiveName: ctx.objective?.name || null,
+          objectiveLabel: ctx.objective?.label || null,
+          sectionCount: d.sectionCount || null,
+        });
+      }
+    } catch (err) {
+      ctx.log(`  [idempotent] check failed (continuing with fresh generation): ${err.message}`);
+    }
+  }
 
   // ── LLM enrichment pre-pass ─────────────────────────────────────
   // Translates strategic playbooks (WISER-format briefs) into tactical
   // step-plan markdown the judges can iterate on. Pass-through for
-  // already-tactical input. Result lands in stages.decompose.data so
-  // the WISER Playbooks UI can show "here's what we extracted from
-  // your playbook" side-by-side with the original strategic brief.
-  //
-  // Requires ANTHROPIC_KEY / ANTHROPIC_API_KEY env var OR --api-key CLI flag.
-  // If absent, enrichment gracefully degrades to pass-through — downstream
-  // Conceive has its own LLM extractor that will pick up the slack (using
-  // Edison's in-flow auth-external-component which reads the Anthropic KV).
-  const { getApiKey } = require('./llmClient');
-  const apiKey = ctx.opts.apiKey || getApiKey() || process.env.ANTHROPIC_API_KEY;
+  // already-tactical input.
   ctx.log('  Pre-pass: enriching playbook (strategic → tactical)...');
   const enrichment = await enrichPlaybookToTacticalSpec(ctx.playbook, {
     apiKey,
@@ -1162,27 +1197,51 @@ async function stageDecompose(ctx) {
     ctx.log(`    ${j.id.padEnd(16)} ${j.score.toFixed(2)}/10 (${j.findings.length} findings)`);
   }
 
-  // ── Playbook asset — attach the detailed plan to the source playbook ──
-  // Writes through lib/playbookAssets so the same shape + graph-sync
-  // semantics apply across every stage that produces a derived artifact.
-  // Asset id is `detailed-plan:<playbookId>:<jobId>` — re-runs of the
-  // same pipeline job overwrite, while different jobs accumulate.
+  // ── Detailed-plan generation (sectioned) ─────────────────────────
+  // Run the 3-wave sectioned generator against the iterated plan.
+  // Produces a structured JSON object covering identity/inputs/outputs/
+  // exits/ui/events/platformRequirements/logic/integrations/testing/
+  // useCases. Stored as a playbook asset with kind='detailed-plan'.
   //
-  // Non-fatal: any failure here is logged but does NOT break the stage;
-  // the plan is still in ctx (and the job dir) so downstream stages
-  // carry on. Graph sync is fire-and-forget per WISER conventions.
+  // Non-fatal: generator failures are logged but don't break the
+  // stage; ctx.bestPlan + ctx.objective are still populated from the
+  // iteration above so downstream stages can continue.
   let attachedAsset = null;
+  let detailedPlan = null;
   if (ctx.playbookHandle?.id) {
     try {
+      ctx.log('  ── Generating detailed plan (sectioned) ──');
+      const { generateDetailedPlan, PLAN_SCHEMA_VERSION, renderPlanAsMarkdown } = require('./detailedPlanGenerator');
+      detailedPlan = await generateDetailedPlan({
+        playbookId: ctx.playbookHandle.id,
+        playbook: iterResult.bestPlan,
+        apiKey,
+        log: (m) => ctx.log(m),
+      });
+      const sectionCount = detailedPlan && detailedPlan.sections
+        ? Object.values(detailedPlan.sections).filter((v) => v !== null).length
+        : 0;
+      ctx.log(`  [detailed-plan] ${sectionCount}/11 sections generated in ${detailedPlan?.elapsedMs || 0}ms`);
+
       const { addPlaybookAsset, buildAsset, assetIdFor } = require('./playbookAssets');
       const planAsset = buildAsset({
         id: assetIdFor('detailed-plan', ctx.playbookHandle.id, ctx.jobId),
         kind: 'detailed-plan',
         title: `Detailed plan — ${ctx.objective.label || ctx.objective.name || 'step'}`,
-        content: iterResult.bestPlan,
+        content: renderPlanAsMarkdown(detailedPlan),  // human-readable markdown
         data: {
+          // Schema version for idempotency checks on next run
+          schemaVersion: PLAN_SCHEMA_VERSION,
+          // The full sectioned plan (LLM consumers read this directly)
+          sections: detailedPlan.sections,
+          sectionErrors: detailedPlan.sectionErrors,
+          sectionCount,
+          // Cached best plan + objective so downstream stages can reuse
+          // without re-invoking the iteration
+          bestPlan: iterResult.bestPlan,
           objective: ctx.objective,
           extracted: enrichment.extracted || null,
+          // Iteration + judge provenance
           enrichmentKind: enrichment.kind,
           enrichmentConfidence: enrichment.confidence,
           enrichmentGaps: enrichment.gaps || [],
@@ -1199,23 +1258,24 @@ async function stageDecompose(ctx) {
         meta: {
           pipelineStage: 'decompose',
           pipelineJobId: ctx.jobId,
+          generatedAt: detailedPlan?.generatedAt,
         },
       });
       const r = await addPlaybookAsset(ctx.playbookHandle.id, planAsset, {
-        collection: ctx.playbookHandle.collection || 'playbooks',
+        collection: ctx.playbookHandle.collection,  // default riff:sheets
         log: (m) => ctx.log('  ' + m),
       });
       if (r.ok) {
-        attachedAsset = { id: planAsset.id, kind: planAsset.kind, synced: r.synced };
-        ctx.log(`  [playbook-asset] attached ${planAsset.kind}:${planAsset.id.slice(-8)} (graph synced: ${r.synced})`);
+        attachedAsset = { id: planAsset.id, kind: planAsset.kind, synced: r.synced, sectionCount };
+        ctx.log(`  [playbook-asset] attached ${planAsset.kind} (${sectionCount} sections; graph synced: ${r.synced})`);
       } else {
         ctx.log(`  [playbook-asset] attach skipped: ${r.reason}`);
       }
     } catch (err) {
-      ctx.log(`  [playbook-asset] attach failed (continuing): ${err.message}`);
+      ctx.log(`  [detailed-plan] generation failed (continuing with base plan only): ${err.message}`);
     }
   } else {
-    ctx.log('  [playbook-asset] no playbookHandle.id on ctx — skipping asset attach');
+    ctx.log('  [playbook-asset] no playbookHandle.id on ctx — skipping asset attach (detailed plan not generated)');
   }
 
   return endStage(s, {

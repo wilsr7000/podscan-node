@@ -59,7 +59,13 @@
 
 const ACCOUNT_ID = process.env.ONEREACH_ACCOUNT_ID || '35254342-4a2e-475b-aec1-18547e517e29';
 const BASE_URL = `https://em.edison.api.onereach.ai/http/${ACCOUNT_ID}`;
-const KV_COLLECTION_DEFAULT = 'playbooks';
+
+// Playbooks live in the 'riff:sheets' KV collection (verified against the
+// live graph: Playbook.kv_collection === 'riff:sheets'). The Playbook schema
+// version at time of writing is 2.0.0 — propagated to new graph writes so
+// consumers can detect schema drift.
+const KV_COLLECTION_DEFAULT = 'riff:sheets';
+const PLAYBOOK_SCHEMA_VERSION = '2.0.0';
 
 // Neo4j Cypher Proxy flow path — deployed via deploy-neo4j-proxy.js. The
 // proxy accepts { cypher, parameters } and returns { records, summary }.
@@ -165,22 +171,37 @@ async function syncPlaybookToGraph(playbook, { log = console.log, timeoutMs = 15
     return { ok: false, reason: 'no-id' };
   }
 
+  // Property names below MUST match the live Playbook schema in NEON
+  // (discovered via `MATCH (p:Playbook) RETURN keys(p)`):
+  //   - `spaceId` (NOT `spacesSpaceId`)
+  //   - `updated_at` in epoch millis (not ISO string)
+  //   - `kv_ref` as the full HTTPS URL to the KV endpoint (not a path)
+  //   - `kv_collection` kept in sync with the collection used for writes
+  //   - `schema_version` stamped at 2.0.0 for drift detection
+  //
+  // We don't invent properties (no more `assetCount`). The count lives on
+  // the KV body; the graph indexes identity + location only.
+  const nowMillis = Date.now();
+  const collection = KV_COLLECTION_DEFAULT;
+  const kvRefUrl = `${BASE_URL}/keyvalue?id=${encodeURIComponent(collection)}&key=${encodeURIComponent(playbook.id)}`;
   const cypher = `
     MERGE (p:Playbook {id: $playbookId})
     SET p.title          = coalesce($title, p.title),
         p.updated_at     = $updatedAt,
-        p.assetCount     = $assetCount,
-        p.spacesSpaceId  = coalesce($spaceId, p.spacesSpaceId),
-        p.kv_ref         = coalesce($kvRef, p.kv_ref)
+        p.spaceId        = coalesce($spaceId, p.spaceId),
+        p.kv_ref         = $kvRef,
+        p.kv_collection  = $kvCollection,
+        p.schema_version = coalesce(p.schema_version, $schemaVersion)
     RETURN p.id AS id
   `;
   const parameters = {
     playbookId: playbook.id,
     title: playbook.title || null,
-    updatedAt: new Date().toISOString(),
-    assetCount: Array.isArray(playbook.assets) ? playbook.assets.length : 0,
-    spaceId: playbook.spacesSpaceId || playbook.spaceId || null,
-    kvRef: `playbooks/${playbook.id}`,
+    updatedAt: nowMillis,
+    spaceId: playbook.spaceId || null,  // Real schema property — NOT spacesSpaceId
+    kvRef: kvRefUrl,
+    kvCollection: collection,
+    schemaVersion: PLAYBOOK_SCHEMA_VERSION,
   };
 
   try {
@@ -284,7 +305,7 @@ async function addPlaybookAsset(playbookId, asset, options = {}) {
   const updated = {
     ...current,
     assets: updatedAssets,
-    updatedAt: new Date().toISOString(),
+    updated_at: Date.now(),  // epoch millis — matches graph schema convention
   };
 
   log(`[playbookAssets] writing ${collection}/${playbookId} with ${updatedAssets.length} asset(s) (merged ${asset.kind}:${asset.id})`);
@@ -341,7 +362,7 @@ async function addPlaybookAssets(playbookId, assets, options = {}) {
   const updated = {
     ...current,
     assets: updatedAssets,
-    updatedAt: new Date().toISOString(),
+    updated_at: Date.now(),
   };
 
   log(`[playbookAssets] writing ${collection}/${playbookId} with ${updatedAssets.length} asset(s) (+${assets.length} new, kinds: ${[...new Set(assets.map((a) => a.kind))].join(',')})`);
@@ -408,6 +429,10 @@ module.exports = {
   mergeAssets,
   assetIdFor,
   syncPlaybookToGraph,
+  // Schema constants — exported for consumers building against the
+  // canonical Playbook shape.
+  PLAYBOOK_SCHEMA_VERSION,
+  KV_COLLECTION_DEFAULT,
   // Exposed for tests only — don't use directly
   _kvGet: kvGet,
   _kvPut: kvPut,

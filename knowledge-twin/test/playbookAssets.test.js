@@ -232,7 +232,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('addPlaybookAsset appends a new asset and persists to KV', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -245,16 +245,17 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.playbook.assets.length, 1);
       assertEq(r.playbook.assets[0].kind, 'detailed-plan');
       // KV was actually written
-      const stored = kv.get('playbooks/pb-1');
+      const stored = kv.get('riff:sheets/pb-1');
       assertEq(stored.assets.length, 1);
       assertEq(stored.assets[0].id, 'a-1');
-      assert(stored.updatedAt, 'updatedAt stamped');
+      assert(typeof stored.updated_at === 'number', 'updated_at stamped as epoch millis');
+      assert(stored.updated_at > Date.now() - 10000, 'updated_at is fresh');
     } finally { restore(); await srv.close(); }
   });
 
   await test('addPlaybookAsset replaces by id on re-run (same kind:playbookId:jobId)', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', {
+    kv.set('riff:sheets/pb-1', {
       id: 'pb-1',
       title: 'Test',
       assets: [{ id: 'a-1', kind: 'detailed-plan', content: 'v1' }],
@@ -285,7 +286,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('addPlaybookAssets batches multiple assets in one KV write', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -300,7 +301,7 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.ok, true);
       assertEq(r.assetIds.length, 3);
       assertEq(r.playbook.assets.length, 3);
-      const stored = kv.get('playbooks/pb-1');
+      const stored = kv.get('riff:sheets/pb-1');
       assertEq(stored.assets.length, 3);
     } finally { restore(); await srv.close(); }
   });
@@ -309,7 +310,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('syncGraph:true (default) calls the graph proxy', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', title: 'Test', assets: [] });
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -323,7 +324,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('graph proxy HTTP 500 does NOT fail the write — ok:true, synced:false', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', assets: [] });
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [] });
     const srv = await mkServer({ kv, graphBehavior: 'error-500' });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -333,13 +334,13 @@ function installFetchRewrite(mockUrl) {
       assertEq(r.ok, true);
       assertEq(r.synced, false);
       // KV still written
-      assertEq(kv.get('playbooks/pb-1').assets.length, 1);
+      assertEq(kv.get('riff:sheets/pb-1').assets.length, 1);
     } finally { restore(); await srv.close(); }
   });
 
   await test('syncGraph:false skips the proxy entirely', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', assets: [] });
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [] });
     const srv = await mkServer({ kv });
     const restore = installFetchRewrite(srv.url);
     try {
@@ -354,7 +355,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('getPlaybookAsset returns the matching asset by id', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', assets: [
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [
       { id: 'a1', kind: 'x' }, { id: 'a2', kind: 'y' },
     ]});
     const srv = await mkServer({ kv });
@@ -371,7 +372,7 @@ function installFetchRewrite(mockUrl) {
 
   await test('listPlaybookAssets filters by kind', async () => {
     const kv = new Map();
-    kv.set('playbooks/pb-1', { id: 'pb-1', assets: [
+    kv.set('riff:sheets/pb-1', { id: 'pb-1', assets: [
       { id: 'a1', kind: 'detailed-plan' },
       { id: 'a2', kind: 'step-spec' },
       { id: 'a3', kind: 'detailed-plan' },

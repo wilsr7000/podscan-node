@@ -38,6 +38,7 @@ function parseArgs(argv) {
     if (arg === '--inject-probe' && args[i + 1])  { opts.injectProbe = args[++i]; continue; }
     if (arg === '--spawn-harness') { opts.spawnHarness = true; continue; }
     if (arg === '--harness-llm-mode' && args[i + 1]) { opts.harnessLlmMode = args[++i]; continue; }
+    if (arg === '--regenerate-plan') { opts.regeneratePlan = true; continue; }
     if (arg === '--monitor') { opts.monitor = true; continue; }
     if (arg === '--help' || arg === '-h') {
       printHelp();
