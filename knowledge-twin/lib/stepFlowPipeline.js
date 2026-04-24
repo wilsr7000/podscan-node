@@ -1162,6 +1162,62 @@ async function stageDecompose(ctx) {
     ctx.log(`    ${j.id.padEnd(16)} ${j.score.toFixed(2)}/10 (${j.findings.length} findings)`);
   }
 
+  // ── Playbook asset — attach the detailed plan to the source playbook ──
+  // Writes through lib/playbookAssets so the same shape + graph-sync
+  // semantics apply across every stage that produces a derived artifact.
+  // Asset id is `detailed-plan:<playbookId>:<jobId>` — re-runs of the
+  // same pipeline job overwrite, while different jobs accumulate.
+  //
+  // Non-fatal: any failure here is logged but does NOT break the stage;
+  // the plan is still in ctx (and the job dir) so downstream stages
+  // carry on. Graph sync is fire-and-forget per WISER conventions.
+  let attachedAsset = null;
+  if (ctx.playbookHandle?.id) {
+    try {
+      const { addPlaybookAsset, buildAsset, assetIdFor } = require('./playbookAssets');
+      const planAsset = buildAsset({
+        id: assetIdFor('detailed-plan', ctx.playbookHandle.id, ctx.jobId),
+        kind: 'detailed-plan',
+        title: `Detailed plan — ${ctx.objective.label || ctx.objective.name || 'step'}`,
+        content: iterResult.bestPlan,
+        data: {
+          objective: ctx.objective,
+          extracted: enrichment.extracted || null,
+          enrichmentKind: enrichment.kind,
+          enrichmentConfidence: enrichment.confidence,
+          enrichmentGaps: enrichment.gaps || [],
+          initialScore: iterResult.initialEvaluation.summary.weightedMean,
+          bestScore: iterResult.bestEvaluation.summary.weightedMean,
+          iterations: iterResult.iterations.length,
+          completed: iterResult.completed,
+          judges: iterResult.bestEvaluation.judges.map((j) => ({
+            id: j.id,
+            score: j.score,
+            findingCount: (j.findings || []).length,
+          })),
+        },
+        meta: {
+          pipelineStage: 'decompose',
+          pipelineJobId: ctx.jobId,
+        },
+      });
+      const r = await addPlaybookAsset(ctx.playbookHandle.id, planAsset, {
+        collection: ctx.playbookHandle.collection || 'playbooks',
+        log: (m) => ctx.log('  ' + m),
+      });
+      if (r.ok) {
+        attachedAsset = { id: planAsset.id, kind: planAsset.kind, synced: r.synced };
+        ctx.log(`  [playbook-asset] attached ${planAsset.kind}:${planAsset.id.slice(-8)} (graph synced: ${r.synced})`);
+      } else {
+        ctx.log(`  [playbook-asset] attach skipped: ${r.reason}`);
+      }
+    } catch (err) {
+      ctx.log(`  [playbook-asset] attach failed (continuing): ${err.message}`);
+    }
+  } else {
+    ctx.log('  [playbook-asset] no playbookHandle.id on ctx — skipping asset attach');
+  }
+
   return endStage(s, {
     // enrichment summary
     enrichmentKind: enrichment.kind,
@@ -1182,6 +1238,8 @@ async function stageDecompose(ctx) {
     // full derived artifacts — written to KV so WISER UI can render them
     extracted: enrichment.extracted,
     stepPlan: iterResult.bestPlan,
+    // Asset provenance — id users can query to find this exact plan later
+    asset: attachedAsset,
   });
 }
 
