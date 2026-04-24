@@ -4031,6 +4031,42 @@ async function runPipeline(opts = {}) {
           stoppedEarly = true;
           break;
         }
+
+        // ── Pre-splice short-circuit ──────────────────────────────────
+        // When stageLocalScenarioRun sets ctx.testResults with failed>0
+        // and preSplice:true, we have HIGH-CONFIDENCE local evidence that
+        // the generated code is broken. Continuing through validate →
+        // splice → testStep → designUI → testWithUI would cost 10-15
+        // minutes just to confirm what a ~30ms local run already told us.
+        //
+        // Break out of the stage loop here; the outer retry decision
+        // below sees ctx.testResults.failed>0 → retryReason='test-
+        // scenario-failures' → regenerates code with the local failure
+        // diagnostics piped back as priorDiagnosis.
+        //
+        // Only fires for PRE-SPLICE results (preSplice:true). Post-splice
+        // testStep failures are handled by the same retry path but only
+        // AFTER validate+testStep+designUI+testWithUI complete — they
+        // already paid the splice tax to get here.
+        if (
+          ctx.testResults
+          && ctx.testResults.preSplice === true
+          && ctx.testResults.failed > 0
+          && outerAttempt < MAX_OUTER_ATTEMPTS
+        ) {
+          const { failed, totalScenarios } = ctx.testResults;
+          ctx.log(`\n  ═══ PRE-SPLICE SHORT-CIRCUIT ═══`);
+          ctx.log(`  ${failed}/${totalScenarios} local scenario(s) failed — skipping validate/testStep/designUI/testWithUI`);
+          ctx.log(`  Jumping straight to outer retry (saves ~15min splice+activate tax per retry cycle)`);
+          appendEvent(jobId, {
+            type: 'pre-splice-short-circuit',
+            stage: stageName,
+            outerAttempt,
+            failed,
+            total: totalScenarios,
+          });
+          break;
+        }
       }
     } catch (err) {
       pipelineError = err;
