@@ -1111,20 +1111,63 @@ async function stageDecompose(ctx) {
 
   const focus = ctx.opts.focus || undefined;
   const maxIterations = ctx.opts.maxIterations || 6;
+  const { getApiKey } = require('./llmClient');
+  const apiKey = ctx.opts.apiKey || getApiKey() || process.env.ANTHROPIC_API_KEY;
+
+  // ── Idempotency check ─────────────────────────────────────────────
+  // If the source playbook already has a fresh "Step Building Playbook"
+  // asset (canonical WISER shape: type=derivative, derivativeFormat=
+  // evaluation, name='Step Building Playbook'), extract the embedded
+  // structured JSON from its markdown body and reuse it. The caller can
+  // override with --regenerate-plan (ctx.opts.regeneratePlan === true).
+  //
+  // This makes decompose effectively a cache lookup on re-runs of the
+  // same playbook, and exactly one authoring pass per unique playbook.
+  if (ctx.playbookHandle?.id && !ctx.opts?.regeneratePlan) {
+    try {
+      const { listPlaybookAssets } = require('./playbookAssets');
+      const { PLAN_SCHEMA_VERSION } = require('./detailedPlanGenerator');
+      // Filter by type+derivativeFormat+name (canonical WISER shape)
+      const existing = await listPlaybookAssets(ctx.playbookHandle.id, {
+        collection: ctx.playbookHandle.collection,
+        type: 'derivative',
+        derivativeFormat: 'evaluation',
+      });
+      const mine = existing.filter((a) => a.name === 'Step Building Playbook');
+      // Extract embedded structured JSON from each asset's markdown body
+      // and pick the newest one with a matching schemaVersion.
+      const parsed = mine.map((a) => {
+        const m = (a.data || '').match(/```json\s*\n([\s\S]*?)\n```/);
+        let structured = null;
+        if (m) { try { structured = JSON.parse(m[1]); } catch {} }
+        return { asset: a, structured };
+      }).filter((x) => x.structured && x.structured.schemaVersion === PLAN_SCHEMA_VERSION);
+      parsed.sort((a, b) => String(b.structured.generatedAt || '').localeCompare(String(a.structured.generatedAt || '')));
+      const freshest = parsed[0];
+      if (freshest) {
+        const d = freshest.structured;
+        ctx.bestPlan = d.bestPlan || '';
+        ctx.objective = d.objective || extractObjective(ctx.bestPlan || '');
+        ctx.extractedSpec = d.extracted || null;
+        ctx.log(`  [idempotent] reused existing Step Building Playbook asset ${freshest.asset.id} (generated ${d.generatedAt || 'unknown'})`);
+        return endStage(s, {
+          reused: true,
+          assetId: freshest.asset.id,
+          schemaVersion: d.schemaVersion,
+          objectiveName: ctx.objective?.name || null,
+          objectiveLabel: ctx.objective?.label || null,
+          sectionCount: d.sectionCount || null,
+        });
+      }
+    } catch (err) {
+      ctx.log(`  [idempotent] check failed (continuing with fresh generation): ${err.message}`);
+    }
+  }
 
   // ── LLM enrichment pre-pass ─────────────────────────────────────
   // Translates strategic playbooks (WISER-format briefs) into tactical
   // step-plan markdown the judges can iterate on. Pass-through for
-  // already-tactical input. Result lands in stages.decompose.data so
-  // the WISER Playbooks UI can show "here's what we extracted from
-  // your playbook" side-by-side with the original strategic brief.
-  //
-  // Requires ANTHROPIC_KEY / ANTHROPIC_API_KEY env var OR --api-key CLI flag.
-  // If absent, enrichment gracefully degrades to pass-through — downstream
-  // Conceive has its own LLM extractor that will pick up the slack (using
-  // Edison's in-flow auth-external-component which reads the Anthropic KV).
-  const { getApiKey } = require('./llmClient');
-  const apiKey = ctx.opts.apiKey || getApiKey() || process.env.ANTHROPIC_API_KEY;
+  // already-tactical input.
   ctx.log('  Pre-pass: enriching playbook (strategic → tactical)...');
   const enrichment = await enrichPlaybookToTacticalSpec(ctx.playbook, {
     apiKey,
@@ -1162,6 +1205,100 @@ async function stageDecompose(ctx) {
     ctx.log(`    ${j.id.padEnd(16)} ${j.score.toFixed(2)}/10 (${j.findings.length} findings)`);
   }
 
+  // ── Detailed-plan generation (sectioned) ─────────────────────────
+  // Run the 3-wave sectioned generator against the iterated plan.
+  // Produces a structured JSON object covering identity/inputs/outputs/
+  // exits/ui/events/platformRequirements/logic/integrations/testing/
+  // useCases. Stored as a playbook asset with kind='detailed-plan'.
+  //
+  // Non-fatal: generator failures are logged but don't break the
+  // stage; ctx.bestPlan + ctx.objective are still populated from the
+  // iteration above so downstream stages can continue.
+  let attachedAsset = null;
+  let detailedPlan = null;
+  if (ctx.playbookHandle?.id) {
+    try {
+      ctx.log('  ── Generating Step Building Playbook (sectioned) ──');
+      const { generateDetailedPlan, PLAN_SCHEMA_VERSION, renderPlanAsMarkdown } = require('./detailedPlanGenerator');
+      detailedPlan = await generateDetailedPlan({
+        playbookId: ctx.playbookHandle.id,
+        playbook: iterResult.bestPlan,
+        apiKey,
+        log: (m) => ctx.log(m),
+      });
+      const sectionCount = detailedPlan && detailedPlan.sections
+        ? Object.values(detailedPlan.sections).filter((v) => v !== null).length
+        : 0;
+      ctx.log(`  [step-building-playbook] ${sectionCount}/11 sections generated in ${detailedPlan?.elapsedMs || 0}ms`);
+
+      // Render the plan as markdown + embed structured JSON for LLM
+      // consumers at the bottom (within a fenced code block).
+      const renderedMarkdown = renderPlanAsMarkdown(detailedPlan);
+      const structuredJson = {
+        schemaVersion: PLAN_SCHEMA_VERSION,
+        sections: detailedPlan.sections,
+        sectionErrors: detailedPlan.sectionErrors,
+        sectionCount,
+        // Provenance for downstream stages
+        bestPlan: iterResult.bestPlan,
+        objective: ctx.objective,
+        extracted: enrichment.extracted || null,
+        enrichmentKind: enrichment.kind,
+        enrichmentConfidence: enrichment.confidence,
+        enrichmentGaps: enrichment.gaps || [],
+        initialScore: iterResult.initialEvaluation.summary.weightedMean,
+        bestScore: iterResult.bestEvaluation.summary.weightedMean,
+        iterations: iterResult.iterations.length,
+        completed: iterResult.completed,
+        judges: iterResult.bestEvaluation.judges.map((j) => ({
+          id: j.id,
+          score: j.score,
+          findingCount: (j.findings || []).length,
+        })),
+        pipelineJobId: ctx.jobId,
+        generatedAt: detailedPlan?.generatedAt,
+      };
+      const bodyWithJson = renderedMarkdown
+        + '\n\n---\n\n<!-- structured JSON for LLM / pipeline consumers -->\n\n```json\n'
+        + JSON.stringify(structuredJson, null, 2)
+        + '\n```\n';
+
+      // Build the canonical WISER NoteAsset (type: derivative,
+      // derivativeFormat: evaluation, derivedFrom: { noteId, noteTitle })
+      const { addPlaybookAsset, buildStepBuildingPlaybookAsset } = require('./playbookAssets');
+      const pbTitle = ctx.playbookSourceTitle || ctx.playbookHandle.title || '';
+      const planAsset = buildStepBuildingPlaybookAsset({
+        playbookId: ctx.playbookHandle.id,
+        playbookTitle: pbTitle,
+        stepLabel: ctx.objective?.label || ctx.objective?.name,
+        markdown: bodyWithJson,
+        jobId: ctx.jobId,
+        prompt: `Step building playbook for "${ctx.objective?.label || ctx.objective?.name || 'step'}" — generated via 11-section sectioned pipeline (identity, inputs, outputs, exits, ui, events, platformRequirements, logic, integrations, testing, useCases).`,
+      });
+      const r = await addPlaybookAsset(ctx.playbookHandle.id, planAsset, {
+        collection: ctx.playbookHandle.collection,  // default riff:sheets
+        log: (m) => ctx.log('  ' + m),
+      });
+      if (r.ok) {
+        attachedAsset = {
+          id: planAsset.id,
+          type: planAsset.type,
+          name: planAsset.name,
+          derivativeFormat: planAsset.derivativeFormat,
+          synced: r.synced,
+          sectionCount,
+        };
+        ctx.log(`  [playbook-asset] attached "${planAsset.name}" (${sectionCount} sections; graph synced: ${r.synced})`);
+      } else {
+        ctx.log(`  [playbook-asset] attach skipped: ${r.reason}`);
+      }
+    } catch (err) {
+      ctx.log(`  [step-building-playbook] generation failed (continuing with base plan only): ${err.message}`);
+    }
+  } else {
+    ctx.log('  [playbook-asset] no playbookHandle.id on ctx — skipping asset attach (step building playbook not generated)');
+  }
+
   return endStage(s, {
     // enrichment summary
     enrichmentKind: enrichment.kind,
@@ -1182,6 +1319,8 @@ async function stageDecompose(ctx) {
     // full derived artifacts — written to KV so WISER UI can render them
     extracted: enrichment.extracted,
     stepPlan: iterResult.bestPlan,
+    // Asset provenance — id users can query to find this exact plan later
+    asset: attachedAsset,
   });
 }
 
@@ -4029,6 +4168,42 @@ async function runPipeline(opts = {}) {
           ctx.log(`\n  Stopped after: ${stageName}`);
           appendEvent(jobId, { type: 'pipeline-stopped', stage: stageName, outerAttempt });
           stoppedEarly = true;
+          break;
+        }
+
+        // ── Pre-splice short-circuit ──────────────────────────────────
+        // When stageLocalScenarioRun sets ctx.testResults with failed>0
+        // and preSplice:true, we have HIGH-CONFIDENCE local evidence that
+        // the generated code is broken. Continuing through validate →
+        // splice → testStep → designUI → testWithUI would cost 10-15
+        // minutes just to confirm what a ~30ms local run already told us.
+        //
+        // Break out of the stage loop here; the outer retry decision
+        // below sees ctx.testResults.failed>0 → retryReason='test-
+        // scenario-failures' → regenerates code with the local failure
+        // diagnostics piped back as priorDiagnosis.
+        //
+        // Only fires for PRE-SPLICE results (preSplice:true). Post-splice
+        // testStep failures are handled by the same retry path but only
+        // AFTER validate+testStep+designUI+testWithUI complete — they
+        // already paid the splice tax to get here.
+        if (
+          ctx.testResults
+          && ctx.testResults.preSplice === true
+          && ctx.testResults.failed > 0
+          && outerAttempt < MAX_OUTER_ATTEMPTS
+        ) {
+          const { failed, totalScenarios } = ctx.testResults;
+          ctx.log(`\n  ═══ PRE-SPLICE SHORT-CIRCUIT ═══`);
+          ctx.log(`  ${failed}/${totalScenarios} local scenario(s) failed — skipping validate/testStep/designUI/testWithUI`);
+          ctx.log(`  Jumping straight to outer retry (saves ~15min splice+activate tax per retry cycle)`);
+          appendEvent(jobId, {
+            type: 'pre-splice-short-circuit',
+            stage: stageName,
+            outerAttempt,
+            failed,
+            total: totalScenarios,
+          });
           break;
         }
       }
